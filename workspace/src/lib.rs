@@ -134,6 +134,10 @@ unsafe impl Sync for MpscSlot {}
 struct MpscLane {
     slots: Box<[MpscSlot]>,
     next_slot: AtomicUsize,
+    // Producer-local starting point for the bounded authoritative token scan.
+    // This is only a search cursor; a FREE->RESERVED CAS remains the sole
+    // occupancy reservation decision and a stale cursor is harmless.
+    next_token: AtomicUsize,
     // A bounded SPSC publication ring. It contains successful lane
     // publications in FIFO order; at most capacity items and one in-flight
     // publication can exist in the ring.
@@ -174,6 +178,7 @@ impl MpscLane {
         Ok(Self {
             slots: slots.into_boxed_slice(),
             next_slot: AtomicUsize::new(0),
+            next_token: AtomicUsize::new(0),
             publications: publications.into_boxed_slice(),
             publication_tail: AtomicUsize::new(0),
         })
@@ -271,7 +276,8 @@ struct MpscConsumerState {
     // A candidate is present in this table exactly while its heap record is
     // live. It prevents duplicate heap entries and makes stale entries
     // discardable after slot reuse.
-    indexed_slots: Vec<Vec<Option<MpscCandidate>>>,
+    indexed_slots: Vec<Option<MpscCandidate>>,
+    slot_count: usize,
     heap: BinaryHeap<MpscCandidate>,
 }
 
@@ -283,11 +289,34 @@ impl MpscConsumerState {
         let mut heap = BinaryHeap::new();
         heap.try_reserve_exact(heap_capacity)
             .map_err(|_| STATUS_INTERNAL_ERROR)?;
+
+        // Do not use vec! here: consumer handles are part of queue
+        // initialization, and an allocation failure must be reported through
+        // the existing ABI status instead of panicking. These vectors are
+        // never grown by enqueue/dequeue operations.
+        let mut publication_reads = Vec::new();
+        publication_reads
+            .try_reserve_exact(lane_count)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        publication_reads.resize(lane_count, 0);
+
+        let mut indexed_slots = Vec::new();
+        indexed_slots
+            .try_reserve_exact(heap_capacity)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        indexed_slots.resize(heap_capacity, None);
+
         Ok(Self {
-            publication_reads: vec![0; lane_count],
-            indexed_slots: vec![vec![None; slot_count]; lane_count],
+            publication_reads,
+            indexed_slots,
+            slot_count,
             heap,
         })
+    }
+
+    #[inline]
+    fn slot_index(&self, lane: usize, slot: usize) -> usize {
+        lane * self.slot_count + slot
     }
 }
 
@@ -345,12 +374,19 @@ impl MpscState {
         }
     }
 
-    fn claim_occupancy_token(&self, owner: usize, slot: &MpscSlot) -> Option<usize> {
+    fn claim_occupancy_token(
+        &self,
+        owner: usize,
+        slot: &MpscSlot,
+        token_cursor: &AtomicUsize,
+    ) -> Option<usize> {
         // There is intentionally no separate count or publication hint here.
         // The FREE->RESERVED CAS is the only occupancy reservation point; if
         // every token fails that CAS, FULL can be linearized at the final
         // failed scan without depending on stale derived state.
-        for token_index in 0..self.capacity {
+        let start = token_cursor.fetch_add(1, AtomicOrdering::Relaxed) % self.capacity;
+        for offset in 0..self.capacity {
+            let token_index = start.wrapping_add(offset) % self.capacity;
             let token = &self.occupancy_tokens[token_index];
             // Publish the candidate before attempting the CAS. The hint is
             // deliberately advisory; the consumer validates the token's
@@ -367,6 +403,10 @@ impl MpscState {
                 )
                 .is_ok()
             {
+                token_cursor.store(
+                    token_index.wrapping_add(1) % self.capacity,
+                    AtomicOrdering::Relaxed,
+                );
                 return Some(token_index);
             }
         }
@@ -413,7 +453,7 @@ impl MpscState {
         };
         let lane = &self.lanes[producer_id as usize];
         let publication = lane.begin_publication(slot_index);
-        let Some(token_index) = self.claim_occupancy_token(owner, slot) else {
+        let Some(token_index) = self.claim_occupancy_token(owner, slot, &lane.next_token) else {
             lane.rollback_publication(publication);
             slot.reset_for_reuse();
             return STATUS_FULL;
@@ -562,7 +602,8 @@ impl MpscState {
     }
 
     fn index_candidate(&self, consumer: &mut MpscConsumerState, candidate: MpscCandidate) {
-        let indexed = &mut consumer.indexed_slots[candidate.lane][candidate.slot];
+        let index = consumer.slot_index(candidate.lane, candidate.slot);
+        let indexed = &mut consumer.indexed_slots[index];
         if *indexed != Some(candidate) {
             *indexed = Some(candidate);
             consumer.heap.push(candidate);
@@ -731,7 +772,8 @@ impl MpscState {
         }
         loop {
             let candidate = *consumer.heap.peek()?;
-            if consumer.indexed_slots[candidate.lane][candidate.slot] != Some(candidate) {
+            let index = consumer.slot_index(candidate.lane, candidate.slot);
+            if consumer.indexed_slots[index] != Some(candidate) {
                 consumer.heap.pop();
                 continue;
             }
@@ -739,7 +781,7 @@ impl MpscState {
                 return Some(candidate);
             }
             consumer.heap.pop();
-            consumer.indexed_slots[candidate.lane][candidate.slot] = None;
+            consumer.indexed_slots[index] = None;
             if let Some(replacement) = self.candidate_from_slot(candidate.lane, candidate.slot)
                 .or_else(|| {
                     self.candidate_from_authoritative_token(candidate.lane, candidate.slot)
@@ -766,7 +808,8 @@ impl MpscState {
         }
 
         consumer.heap.pop();
-        consumer.indexed_slots[candidate.lane][candidate.slot] = None;
+        let index = consumer.slot_index(candidate.lane, candidate.slot);
+        consumer.indexed_slots[index] = None;
         unsafe {
             output[..value_length].copy_from_slice(&(&*slot.buffer.get())[..value_length]);
         }
@@ -777,10 +820,6 @@ impl MpscState {
         self.occupancy_tokens[candidate.token]
             .state
             .store(TOKEN_FREE, AtomicOrdering::Release);
-        // Refresh both newly published records and the slot just made
-        // reusable before returning. This keeps the consumer-local index hot
-        // without consulting every occupancy token.
-        self.refresh_head_index(consumer);
         Ok(value_length)
     }
 

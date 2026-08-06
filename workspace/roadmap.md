@@ -69,7 +69,7 @@ acceptance"); read it before parking or abandoning.
 ## Major
 
 - [x] M1 `done` (rounds 1-2): Replace the queue-wide producer mutex for the MPSC configuration with per-producer bounded SPSC publication lanes plus an atomic global occupancy reservation; the corrective slice made occupancy token state authoritative for publication. Why: the structural producer-contention win is now linearizable and passed the trusted evaluator after removing the stale bitmap/commit protocol.
-- [ ] M2 `in_progress` (round 4): Make MPSC slot payload storage reusable and allocation-free after initialization, while retaining the required copy semantics for arbitrary configured value sizes. Why: the current enqueue constructs and drops a fresh `Vec<u8>` for every successful item, adding allocator and ownership overhead to the measured hot path.
+- [x] M2 `done` (round 4): Make MPSC slot payload storage reusable and allocation-free after initialization, while retaining the required copy semantics for arbitrary configured value sizes. Why: fixed per-slot buffers remove successful-operation payload allocation while preserving copied ownership and metadata reset on reuse.
 - [x] M3 `done` (round 3): Optimize consumer-side minimum-priority selection over producer heads with a maintained head index/heap and cache-friendly slot layout. Why: the consumer-local publication index removed the ordinary capacity-wide token scan while preserving authoritative token validation; the trusted median rose to 457,982 total_ops_per_sec.
 - [ ] M4 `todo`: Add workload-guided layout and memory-ordering tuning for the MPSC fast path, validated against the trusted end-to-end benchmark. Why: atomics, false sharing, copying, and priority comparisons need measurement-driven refinement after the structural path is correct.
 
@@ -81,6 +81,7 @@ acceptance"); read it before parking or abandoning.
 
 - M1: trusted judge and accuracy gate passed in Round 2; its authoritative-token protocol remains the MPSC correctness base.
 - M3: trusted judge and accuracy gate passed in Round 3; latest benchmark median was 457,982 total_ops_per_sec.
+- M2: fallible consumer-index initialization, reusable slot buffers, repeated arbitrary-length ownership tests, and a native three-repetition benchmark median above 457,982 passed in Round 4.
 - N1: paused-claim, capacity-1/2/3 stress, ownership, conservation, and drain gates passed in Round 2.
 
 ## Parked

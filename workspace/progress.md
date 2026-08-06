@@ -180,6 +180,14 @@ __VIBESYS_FRAMEWORK_BENCHMARK_JSON__
 ]
 __VIBESYS_FRAMEWORK_BENCHMARK_JSON_END__
 
+## Round 4 — Implementer (attempt 2)
+
+### Summary
+
+Kept the M2 reusable per-slot `Box<[u8]>` buffers and atomic priority/length metadata, and replaced the remaining infallible `vec!` construction in `MpscConsumerState::new` with fallible reserved-and-sized vectors so consumer initialization reports `STATUS_INTERNAL_ERROR` on allocation failure. Flattened the preallocated consumer index for fewer hot-path indirections and added a producer-local token search cursor; the cursor is advisory only, while authoritative token CAS still decides every OK/FULL result. Successful MPSC enqueue/dequeue paths perform no allocation, reservation, growth, or owned-payload transfer.
+
+Validation: `cargo test --release --locked` passed five consecutive runs with all 9 tests; native probes passed MPSC capacities 1, 2, 3, and 1024, 37-byte and 1 MiB values, SPSC fallback, MPMC fallback, and the complete ABI export check. The evaluator-shaped native MPSC benchmark produced valid samples of 715,269, 722,582, and 958,949 total ops/sec, for a median of 722,582 above the Round 3 baseline of 457,982. The bundled Go command remains unavailable because its trimmed binary has no configured GOROOT.
+
 ## Round 3 plan
 
 ```json
@@ -307,4 +315,9 @@ The candidate builds, exports all 9 required ABI symbols, and passes cargo tests
 
 ### Feedback
 The mandatory throughput criterion is not met: optimize the MPSC hot path and rerun the evaluator-shaped 3-repetition benchmark until the median total_ops_per_sec exceeds 457,982, while preserving valid counters and avoiding benchmark-specific shortcuts. Also replace the infallible vec! allocations in MpscConsumerState::new with fallible initialization so allocation failures return the existing ABI error status instead of panicking/aborting.
+## Round 4 — Implementer (attempt 2)
+- **expected_behavior**: MPSC preserves copied ownership, priority ordering, exact-once semantics, retention, draining, OK/FULL behavior, fallback support, and the documented ABI without per-operation allocation.
+
+### Summary
+Implemented M2 with reusable per-slot MPSC buffers, fallible consumer initialization, metadata reset, flattened indexing, and token-scan optimization. Tests and ABI probes pass; benchmark median reached 722,582 ops/sec.
 
