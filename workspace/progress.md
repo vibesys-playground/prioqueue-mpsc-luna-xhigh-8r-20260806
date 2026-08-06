@@ -489,3 +489,12 @@ Validation: `cargo test --release --locked` passed all 12 tests; native ABI prob
 ### Summary
 Implemented M6’s single leaf-word fetch_or optimization and added focused empty/non-empty release plus stale-summary repair tests. Rebuilt the artifact without M5 symbols; all 12 Rust tests and native probes pass.
 
+## Round 7 — Judge (attempt 1)
+- **verdict**: fail
+
+### Analysis
+The candidate builds successfully, exports all nine required ABI symbols, and cargo test --release --locked passes all 12 tests. Direct trusted native probes pass MPSC capacities 1, 2, 3, and 1024, maximum 1 MiB values, and SPSC/SPMC/MPMC fallback shapes. Static inspection confirms authoritative occupancy-token CAS reservation, one leaf-word fetch_or in mark_token_likely_free with summary restoration only when the prior leaf word was zero, bounded repair, no M5 active-lane overlay, no benchmark shortcut, and allocation-free successful MPSC enqueue/dequeue paths. However, the exact native benchmark configuration produced valid counters but rates of 1,281,878.036, 1,059,980.673, and 1,363,798.154 total_ops/sec; the median was 1,281,878.036, below the required strict threshold of 1,598,401. The Go accuracy checker could not run because the available Go 1.19 toolchain lacks cmp and slices, but this does not change the independently demonstrated benchmark failure.
+
+### Feedback
+Optimize the MPSC hot path until the exact trusted 2-second-warmup/10-second/3-repetition benchmark reports a raw median strictly above 1,598,401 total_ops/sec with valid conservation counters. Do not rely on rounded output showing 1,598,401; the raw median must exceed the threshold. Re-run the full trusted accuracy checker in a Go toolchain containing cmp and slices before submission.
+
