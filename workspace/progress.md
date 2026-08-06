@@ -337,3 +337,38 @@ The candidate builds successfully, exports the required ABI symbols/version, and
 ### Output
 PASS - mpsc linearizable bounded priority queue (50 trials, approximately 24 ops/trial, 4P/1C, capacity=1024, value_size=8)
 
+## Round 4 — Framework benchmark (attempt 2)
+- **verdict**: pass
+- **command**: `go -C _evaluator/priority-queue run . benchmark --workspace ../.. --scenario mpsc --repetitions 3`
+- **total_ops_per_sec**: 820458.210772
+
+### Output
+Scenario: mpsc  Repetitions: 3  Median successful ops/s: 820458
+  Samples: [977403.865615 648420.251709 820458.210772]
+Scenario: mpsc  Duration: 10.001s  Prod: 4  Cons: 1
+  Enqueued: 4103039  Full: 557761  Dequeued: 4102015  Empty: 1
+  Successful: 8205054  Attempts: 8762816 (820458 successful ops/s)
+
+__VIBESYS_FRAMEWORK_BENCHMARK_JSON__
+[
+  {
+    "scenario": "mpsc",
+    "enqueued": 4103039,
+    "dropped": 557761,
+    "dequeued": 4102015,
+    "empty": 1,
+    "attempts": 8762816,
+    "duration": 10.000575157,
+    "total_ops_per_sec": 820458.210772,
+    "producers": 4,
+    "consumers": 1,
+    "repetitions": 3,
+    "total_ops_per_sec_samples": [
+      977403.865615,
+      648420.251709,
+      820458.210772
+    ]
+  }
+]
+__VIBESYS_FRAMEWORK_BENCHMARK_JSON_END__
+
