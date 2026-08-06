@@ -266,3 +266,36 @@ __VIBESYS_FRAMEWORK_BENCHMARK_JSON__
 ]
 __VIBESYS_FRAMEWORK_BENCHMARK_JSON_END__
 
+## Round 4 — Orchestrator (pre-round)
+- **need_profile**: False
+- **profile_focus**: 
+- **reasoning**: The latest benchmark improved substantially, and the next optimization is clear from code inspection: MPSC enqueue still allocates a Vec for every item. A fresh profile is unnecessary before planning that staged storage-reuse change.
+
+## Round 4 — Orchestrator (plan)
+- **reasoning**: M3 is trusted-gate complete at a 457,982 total_ops_per_sec median. The remaining identified hot-path cost is a fresh payload Vec allocation and destruction for each successful MPSC enqueue/dequeue. M2 now targets fixed per-slot reusable storage allocated during queue initialization, while retaining the authoritative-token and consumer-head protocols unchanged.
+
+### Task
+Implement M2 in `src/lib.rs`: replace the MPSC slot payload ownership model that creates a fresh `Vec<u8>` for every successful enqueue with reusable per-slot byte storage allocated during `MpscState::new`. Each slot must retain a configured-capacity buffer and metadata for priority and current length; enqueue must copy the caller's bytes into that private buffer before publishing the slot/token, and dequeue must copy the recorded bytes to the caller and reset only the length/metadata so the same storage is reused. Do not allocate, reserve, grow, take/drop an owned payload buffer, or otherwise invoke the heap allocator on the successful MPSC enqueue/dequeue path after initialization. Preserve the authoritative occupancy-token state, advisory publication/head index, paused-claim progress, priority ordering, undersized-output retention, exact-once copied semantics, non-MPSC fallback, and the C ABI documented in `_evaluator/priority-queue/CANDIDATE_CONTRACT.md`. Propagate allocation failure through queue construction using the existing status conventions, and add focused stress/ownership coverage including arbitrary value sizes and repeated slot reuse.
+
+### Pass criteria
+The trusted accuracy checker, ABI probes, and repeated MPSC stress at capacities 1, 2, 3, and 1024 pass with only OK/FULL for valid enqueues, exact-once copied values, lower-priority-first dequeue, undersized-output retention, and final EMPTY drain; paused-after-claim operations remain nonblocking. Static inspection of `src/lib.rs` verifies that MPSC slot buffers are allocated once during initialization and that the successful MPSC enqueue/dequeue path contains no per-operation payload allocation/reservation or owned-buffer take/drop; buffers are reused across repeated slot cycles. Non-MPSC fallback behavior and the documented ABI remain intact. The trusted end-to-end MPSC benchmark reports valid counters and a median `total_ops_per_sec` above the Round 3 baseline of 457,982, without a benchmark-specific shortcut branch.
+## Round 4 — Orchestrator (plan)
+- **reasoning**: M3 is trusted-gate complete at 457,982 total_ops_per_sec median. The remaining clear hot-path cost is allocating and destroying a payload Vec for each successful MPSC operation, so reusable initialized slot storage is the next active Major lever.
+
+### Task
+Implement M2 in src/lib.rs: replace per-enqueue MPSC Vec allocation with reusable per-slot byte buffers allocated during MpscState::new. Store priority and length metadata per slot; copy input bytes into the private buffer before publication, and copy them out on dequeue while resetting metadata for reuse. Preserve authoritative occupancy tokens, the consumer head index, paused-claim progress, priority ordering, undersized-output retention, exact-once semantics, fallback behavior, and the documented C ABI. Ensure allocation failures occur only during initialization and add stress/ownership tests covering arbitrary value sizes and repeated slot reuse.
+
+### Pass criteria
+Trusted accuracy, ABI, and MPSC stress checks pass at capacities 1, 2, 3, and 1024 with only OK/FULL results, exact-once copied values, priority ordering, undersized-output retention, paused-claim progress, and final EMPTY drain. Static inspection confirms MPSC buffers are allocated once during initialization, with no per-operation allocation, reservation, growth, or owned-buffer take/drop on successful enqueue/dequeue paths. Non-MPSC fallback and ABI remain intact. The trusted end-to-end MPSC benchmark reports valid counters and median total_ops_per_sec above the Round 3 baseline of 457,982, without a benchmark-specific shortcut.
+
+## Round 4 — Implementer summary
+
+Implemented M2 in `src/lib.rs`. MPSC slots now allocate one fixed-capacity `Box<[u8]>` buffer during `MpscState::new`, with atomic priority and length metadata. Enqueue copies directly into the reusable slot buffer before publication and returns only `STATUS_OK`/`STATUS_FULL` for valid inputs; dequeue copies from the buffer, resets metadata, and releases the slot/token without taking or dropping an owned payload. The consumer heap is pre-reserved during consumer-handle initialization to keep successful MPSC operations allocation-free.
+
+Added arbitrary-length copied-ownership, undersized-output retention, and repeated slot-reuse coverage. `cargo test --release --locked` passes all 9 Rust tests. Native ABI probes pass MPSC capacities 1, 2, 3, and 1024 (including 1 MiB values), plus SPSC/MPMC fallback shapes; the ABI export set is intact. A native MPSC benchmark reported valid counters and 736,661 successful ops/sec, above the 457,982 Round 3 baseline. The Go checker remains unavailable because the bundled Go 1.19 toolchain lacks the `cmp` and `slices` standard packages.
+## Round 4 — Implementer (attempt 1)
+- **expected_behavior**: MPSC preserves copied ownership, priority ordering, exact-once semantics, undersized-output retention, paused-claim progress, final EMPTY drain, fallback behavior, and the documented C ABI.
+
+### Summary
+Implemented M2 with reusable per-slot MPSC byte buffers, priority/length metadata, allocation-free enqueue/dequeue paths, and arbitrary-length slot-reuse tests. Rust tests, ABI probes, fallbacks, and native benchmark passed (736,661 ops/s).
+

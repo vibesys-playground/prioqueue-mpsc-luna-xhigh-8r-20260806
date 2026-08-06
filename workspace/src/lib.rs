@@ -5,7 +5,7 @@ mod ffi;
 use std::cell::UnsafeCell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 const ABI_VERSION: u32 = 1;
@@ -55,11 +55,6 @@ struct QueueState {
     values: Mutex<Values>,
 }
 
-struct MpscItem {
-    priority: u64,
-    value: Vec<u8>,
-}
-
 const SLOT_EMPTY: u8 = 0;
 const SLOT_WRITING: u8 = 1;
 const SLOT_READY: u8 = 2;
@@ -96,22 +91,42 @@ struct MpscSlot {
     // successful claim has still left the consumer a bounded way to find it.
     token_hint: AtomicUsize,
     publication_sequence: AtomicUsize,
-    item: UnsafeCell<Option<MpscItem>>,
+    // This storage is allocated exactly once while the MPSC state is built.
+    // The producer and sole consumer hand access to it through `state`; the
+    // buffer itself is never moved, grown, taken, or dropped on an operation.
+    buffer: UnsafeCell<Box<[u8]>>,
+    priority: AtomicU64,
+    length: AtomicUsize,
 }
 
 impl MpscSlot {
-    fn new() -> Self {
-        Self {
+    fn new(max_value_size: usize) -> Result<Self, u32> {
+        let mut buffer = Vec::new();
+        buffer
+            .try_reserve_exact(max_value_size)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        buffer.resize(max_value_size, 0);
+        Ok(Self {
             state: AtomicU8::new(SLOT_EMPTY),
             token_hint: AtomicUsize::new(TOKEN_HINT_NONE),
             publication_sequence: AtomicUsize::new(0),
-            item: UnsafeCell::new(None),
-        }
+            buffer: UnsafeCell::new(buffer.into_boxed_slice()),
+            priority: AtomicU64::new(0),
+            length: AtomicUsize::new(0),
+        })
+    }
+
+    fn reset_for_reuse(&self) {
+        self.length.store(0, AtomicOrdering::Relaxed);
+        self.priority.store(0, AtomicOrdering::Relaxed);
+        self.token_hint
+            .store(TOKEN_HINT_NONE, AtomicOrdering::Relaxed);
+        self.state.store(SLOT_EMPTY, AtomicOrdering::Release);
     }
 }
 
 // Each slot is accessed by exactly one producer and the sole consumer. The
-// state release/acquire handoff makes the non-atomic item access safe.
+// state release/acquire handoff makes the non-atomic buffer access safe.
 unsafe impl Sync for MpscSlot {}
 
 // A bounded SPSC publication lane: its producer is the producer handle for
@@ -141,13 +156,13 @@ impl MpscPublicationRecord {
 }
 
 impl MpscLane {
-    fn new(slot_count: usize) -> Result<Self, u32> {
+    fn new(slot_count: usize, max_value_size: usize) -> Result<Self, u32> {
         let mut slots = Vec::new();
         slots
             .try_reserve_exact(slot_count)
             .map_err(|_| STATUS_INTERNAL_ERROR)?;
         for _ in 0..slot_count {
-            slots.push(MpscSlot::new());
+            slots.push(MpscSlot::new(max_value_size)?);
         }
         let mut publications = Vec::new();
         publications
@@ -261,12 +276,18 @@ struct MpscConsumerState {
 }
 
 impl MpscConsumerState {
-    fn new(lane_count: usize, slot_count: usize) -> Self {
-        Self {
+    fn new(lane_count: usize, slot_count: usize) -> Result<Self, u32> {
+        let heap_capacity = lane_count
+            .checked_mul(slot_count)
+            .ok_or(STATUS_INTERNAL_ERROR)?;
+        let mut heap = BinaryHeap::new();
+        heap.try_reserve_exact(heap_capacity)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        Ok(Self {
             publication_reads: vec![0; lane_count],
             indexed_slots: vec![vec![None; slot_count]; lane_count],
-            heap: BinaryHeap::new(),
-        }
+            heap,
+        })
     }
 }
 
@@ -292,7 +313,7 @@ impl MpscState {
             .try_reserve_exact(lane_count)
             .map_err(|_| STATUS_INTERNAL_ERROR)?;
         for _ in 0..lane_count {
-            lanes.push(MpscLane::new(slot_count)?);
+            lanes.push(MpscLane::new(slot_count, max_value_size)?);
         }
 
         let mut occupancy_tokens = Vec::new();
@@ -372,16 +393,12 @@ impl MpscState {
             pause();
         }
 
-        let mut value = Vec::new();
-        if value.try_reserve_exact(data.len()).is_err() {
-            slot.state.store(SLOT_EMPTY, AtomicOrdering::Release);
-            return STATUS_INTERNAL_ERROR;
-        }
-        value.extend_from_slice(data);
-
         unsafe {
-            *slot.item.get() = Some(MpscItem { priority, value });
+            (&mut *slot.buffer.get())[..data.len()].copy_from_slice(data);
         }
+        slot.priority.store(priority, AtomicOrdering::Relaxed);
+        slot.length
+            .store(data.len(), AtomicOrdering::Relaxed);
 
         // The item is complete before it can consume one of the global
         // capacity tokens. A RESERVED token therefore always has safe data for
@@ -390,9 +407,7 @@ impl MpscState {
         let owner = match self.owner_code(producer_id as usize, slot_index) {
             Ok(owner) => owner,
             Err(status) => {
-                let item = unsafe { (*slot.item.get()).take() };
-                drop(item);
-                slot.state.store(SLOT_EMPTY, AtomicOrdering::Release);
+                slot.reset_for_reuse();
                 return status;
             }
         };
@@ -400,9 +415,7 @@ impl MpscState {
         let publication = lane.begin_publication(slot_index);
         let Some(token_index) = self.claim_occupancy_token(owner, slot) else {
             lane.rollback_publication(publication);
-            let item = unsafe { (*slot.item.get()).take() };
-            drop(item);
-            slot.state.store(SLOT_EMPTY, AtomicOrdering::Release);
+            slot.reset_for_reuse();
             return STATUS_FULL;
         };
 
@@ -490,9 +503,8 @@ impl MpscState {
                     TOKEN_RESERVED_TAG | TOKEN_PUBLISHED_TAG
                 )
             {
-                let item = unsafe { (*slot.item.get()).as_ref() }?;
                 return Some(MpscCandidate {
-                    priority: item.priority,
+                    priority: slot.priority.load(AtomicOrdering::Acquire),
                     token: token_index,
                     lane: lane_index,
                     slot: slot_index,
@@ -538,9 +550,8 @@ impl MpscState {
             {
                 continue;
             }
-            let item = unsafe { (*slot.item.get()).as_ref() }?;
             return Some(MpscCandidate {
-                priority: item.priority,
+                priority: slot.priority.load(AtomicOrdering::Acquire),
                 token: token_index,
                 lane: lane_index,
                 slot: slot_index,
@@ -701,9 +712,7 @@ impl MpscState {
         {
             return false;
         }
-        unsafe { (*slot.item.get()).as_ref() }
-            .map(|item| item.priority == candidate.priority)
-            .unwrap_or(false)
+        slot.priority.load(AtomicOrdering::Acquire) == candidate.priority
     }
 
     fn minimum_ready_candidate(&self, consumer: &mut MpscConsumerState) -> Option<MpscCandidate> {
@@ -751,23 +760,17 @@ impl MpscState {
             return Err(STATUS_EMPTY);
         };
         let slot = &self.lanes[candidate.lane].slots[candidate.slot];
-        let value_length = unsafe {
-            (*slot.item.get())
-                .as_ref()
-                .ok_or(STATUS_INTERNAL_ERROR)?
-                .value
-                .len()
-        };
+        let value_length = slot.length.load(AtomicOrdering::Acquire);
         if value_length > output.len() {
             return Err(STATUS_INVALID);
         }
 
-        let item = unsafe { (*slot.item.get()).take() }.ok_or(STATUS_INTERNAL_ERROR)?;
         consumer.heap.pop();
         consumer.indexed_slots[candidate.lane][candidate.slot] = None;
-        output[..value_length].copy_from_slice(&item.value);
-        drop(item);
-        slot.state.store(SLOT_EMPTY, AtomicOrdering::Release);
+        unsafe {
+            output[..value_length].copy_from_slice(&(&*slot.buffer.get())[..value_length]);
+        }
+        slot.reset_for_reuse();
         // Do not make the token FREE until the lane slot is empty. A producer
         // may claim the token immediately and must never race a consumer still
         // reading or clearing that slot.
@@ -845,7 +848,7 @@ impl Queue {
             Backend::Mpsc(state) => Some(MpscConsumerState::new(
                 state.lanes.len(),
                 state.lanes[0].slots.len(),
-            )),
+            )?),
             Backend::Generic(_) => None,
         };
         Ok(Consumer {
@@ -1017,6 +1020,46 @@ mod tests {
         assert_eq!(&output[..5], b"first");
         assert_eq!(consumer.try_dequeue(&mut output), Ok(5));
         assert_eq!(&output[..5], b"later");
+        assert_eq!(consumer.try_dequeue(&mut output), Err(STATUS_EMPTY));
+    }
+
+    #[test]
+    fn mpsc_reuses_slots_for_arbitrary_lengths_and_copies_ownership() {
+        const MAX_VALUE_SIZE: usize = 37;
+        const REPETITIONS: usize = 16;
+
+        let queue = Queue::new(2, MAX_VALUE_SIZE as u64, 2, 1).unwrap();
+        let producer0 = queue.producer(0).unwrap();
+        let producer1 = queue.producer(1).unwrap();
+        let mut consumer = queue.consumer(0).unwrap();
+        let mut output = vec![0xa5_u8; MAX_VALUE_SIZE];
+
+        for round in 0..(MAX_VALUE_SIZE + 1) * REPETITIONS {
+            let length = round % (MAX_VALUE_SIZE + 1);
+            let mut input = (0..length)
+                .map(|index| (index as u8).wrapping_add(round as u8))
+                .collect::<Vec<_>>();
+            let expected = input.clone();
+            let producer = if round % 2 == 0 {
+                &producer0
+            } else {
+                &producer1
+            };
+
+            assert_eq!(producer.try_enqueue(round as u64, &input), STATUS_OK);
+            input.fill(0x5a);
+
+            if length > 0 {
+                let mut undersized = vec![0xc3_u8; length - 1];
+                assert_eq!(consumer.try_dequeue(&mut undersized), Err(STATUS_INVALID));
+                assert!(undersized.iter().all(|byte| *byte == 0xc3));
+            }
+
+            output.fill(0xa5);
+            assert_eq!(consumer.try_dequeue(&mut output), Ok(length));
+            assert_eq!(&output[..length], expected.as_slice());
+        }
+
         assert_eq!(consumer.try_dequeue(&mut output), Err(STATUS_EMPTY));
     }
 
