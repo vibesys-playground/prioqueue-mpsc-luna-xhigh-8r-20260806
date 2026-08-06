@@ -405,3 +405,12 @@ Added a regression test for missing and stale hints, while retaining the existin
 ### Summary
 Implemented M4 with preallocated atomic free-token hint bitsets, authoritative CAS validation, stale-hint retries, bounded fallback scans, release replenishment, and regression coverage. Rust tests, ABI probes, and fallback checks pass; Go evaluator was unavailable due missing GOROOT.
 
+## Round 5 — Judge (attempt 1)
+- **verdict**: fail
+
+### Analysis
+The candidate builds successfully, exports all required ABI symbols, and passes all 10 Rust stress tests. Native probes pass MPSC capacities 1, 2, 3, and 1024, copied values including 1 MiB payloads, and fallback shapes. Static inspection confirms reusable storage, initialized advisory hints, authoritative occupancy-token CAS, and no queue-wide lock or publication bitmap. However, three valid 10-second trusted-native benchmark runs measured 552,489, 676,081, and 641,537 total_ops/sec; the median 641,537 is below the required Round 4 baseline of 820,458. The Go wrapper could not run because the available Go toolchain lacks GOROOT and the Go 1.19 standard library lacks required packages, but the direct native benchmark uses the same trusted benchmark implementation and already demonstrates failure of the mandatory throughput criterion.
+
+### Feedback
+Optimize the MPSC hot path until the exact evaluator-shaped benchmark produces a median total_ops_per_sec above 820,458 with valid counters. Profile reservation hint scanning, publication refresh, heap/index maintenance, and atomic traffic, then rerun three trusted repetitions while preserving all correctness behavior.
+
