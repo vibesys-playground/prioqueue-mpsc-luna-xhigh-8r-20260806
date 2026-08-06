@@ -87,6 +87,10 @@ impl MpscOccupancyToken {
 
 struct MpscSlot {
     state: AtomicU8,
+    // Immutable owner code used by the consumer's authoritative token
+    // validation. Keeping it in the slot avoids repeating the lane/slot
+    // multiplication on every indexed candidate refresh.
+    owner: usize,
     // Advisory reverse lookup for the token claimed by this slot. The store
     // happens before the token CAS, so a producer paused immediately after a
     // successful claim has still left the consumer a bounded way to find it.
@@ -101,7 +105,7 @@ struct MpscSlot {
 }
 
 impl MpscSlot {
-    fn new(max_value_size: usize) -> Result<Self, u32> {
+    fn new(max_value_size: usize, owner: usize) -> Result<Self, u32> {
         let mut buffer = Vec::new();
         buffer
             .try_reserve_exact(max_value_size)
@@ -109,6 +113,7 @@ impl MpscSlot {
         buffer.resize(max_value_size, 0);
         Ok(Self {
             state: AtomicU8::new(SLOT_EMPTY),
+            owner,
             token_hint: AtomicUsize::new(TOKEN_HINT_NONE),
             publication_sequence: AtomicUsize::new(0),
             buffer: UnsafeCell::new(buffer.into_boxed_slice()),
@@ -161,13 +166,18 @@ impl MpscPublicationRecord {
 }
 
 impl MpscLane {
-    fn new(slot_count: usize, max_value_size: usize) -> Result<Self, u32> {
+    fn new(
+        lane_index: usize,
+        slot_count: usize,
+        max_value_size: usize,
+    ) -> Result<Self, u32> {
         let mut slots = Vec::new();
         slots
             .try_reserve_exact(slot_count)
             .map_err(|_| STATUS_INTERNAL_ERROR)?;
-        for _ in 0..slot_count {
-            slots.push(MpscSlot::new(max_value_size)?);
+        for slot_index in 0..slot_count {
+            let owner = lane_index * slot_count + slot_index + 1;
+            slots.push(MpscSlot::new(max_value_size, owner)?);
         }
         let mut publications = Vec::new();
         publications
@@ -245,6 +255,12 @@ struct MpscState {
     // remains the only reservation authority. These words are allocated once
     // with the queue and never resized by an operation.
     free_token_hints: Box<[AtomicUsize]>,
+    // A second advisory bitset marks hint words that currently contain at
+    // least one candidate. It bounds the normal search to the non-empty
+    // hint-word index instead of walking every token-sized word. Like the
+    // token hints, it may lose or retain stale bits without affecting the
+    // authoritative FREE->RESERVED CAS or the bounded repair scan.
+    free_hint_word_hints: Box<[AtomicUsize]>,
     lanes: Box<[MpscLane]>,
 }
 
@@ -347,8 +363,8 @@ impl MpscState {
         lanes
             .try_reserve_exact(lane_count)
             .map_err(|_| STATUS_INTERNAL_ERROR)?;
-        for _ in 0..lane_count {
-            lanes.push(MpscLane::new(slot_count, max_value_size)?);
+        for lane_index in 0..lane_count {
+            lanes.push(MpscLane::new(lane_index, slot_count, max_value_size)?);
         }
 
         let mut occupancy_tokens = Vec::new();
@@ -377,26 +393,42 @@ impl MpscState {
             };
             free_token_hints.push(AtomicUsize::new(mask));
         }
+        let summary_word_count = hint_word_count
+            .checked_add(FREE_TOKEN_HINT_BITS - 1)
+            .ok_or(STATUS_INTERNAL_ERROR)?
+            / FREE_TOKEN_HINT_BITS;
+        let mut free_hint_word_hints = Vec::new();
+        free_hint_word_hints
+            .try_reserve_exact(summary_word_count)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        for summary_index in 0..summary_word_count {
+            let first_hint_word = summary_index * FREE_TOKEN_HINT_BITS;
+            let valid_bits = (hint_word_count - first_hint_word).min(FREE_TOKEN_HINT_BITS);
+            let mask = if valid_bits == FREE_TOKEN_HINT_BITS {
+                usize::MAX
+            } else {
+                (1usize << valid_bits) - 1
+            };
+            free_hint_word_hints.push(AtomicUsize::new(mask));
+        }
 
         Ok(Self {
             capacity,
             max_value_size,
             occupancy_tokens: occupancy_tokens.into_boxed_slice(),
             free_token_hints: free_token_hints.into_boxed_slice(),
+            free_hint_word_hints: free_hint_word_hints.into_boxed_slice(),
             lanes: lanes.into_boxed_slice(),
         })
     }
 
+    #[inline(always)]
     fn owner_code(&self, lane: usize, slot: usize) -> Result<usize, u32> {
-        let linear = lane
-            .checked_mul(self.lanes[lane].slots.len())
-            .and_then(|value| value.checked_add(slot))
-            .and_then(|value| value.checked_add(1))
-            .ok_or(STATUS_INTERNAL_ERROR)?;
-        if linear > TOKEN_OWNER_MASK {
+        let owner = self.lanes[lane].slots[slot].owner;
+        if owner > TOKEN_OWNER_MASK {
             Err(STATUS_INTERNAL_ERROR)
         } else {
-            Ok(linear)
+            Ok(owner)
         }
     }
 
@@ -404,7 +436,13 @@ impl MpscState {
     fn mark_token_likely_free(&self, token_index: usize) {
         let word_index = token_index / FREE_TOKEN_HINT_BITS;
         let bit = 1usize << (token_index % FREE_TOKEN_HINT_BITS);
-        self.free_token_hints[word_index].fetch_or(bit, AtomicOrdering::Relaxed);
+        let previous = self.free_token_hints[word_index].fetch_or(bit, AtomicOrdering::Relaxed);
+        if previous == 0 {
+            let summary_index = word_index / FREE_TOKEN_HINT_BITS;
+            let summary_bit = 1usize << (word_index % FREE_TOKEN_HINT_BITS);
+            self.free_hint_word_hints[summary_index]
+                .fetch_or(summary_bit, AtomicOrdering::Relaxed);
+        }
     }
 
     fn claim_hinted_token(
@@ -415,48 +453,95 @@ impl MpscState {
         token_cursor: &AtomicUsize,
     ) -> Option<usize> {
         let word_count = self.free_token_hints.len();
+        let summary_count = self.free_hint_word_hints.len();
         let start_word = (start / FREE_TOKEN_HINT_BITS) % word_count;
-        for word_offset in 0..word_count {
-            let word_index = (start_word + word_offset) % word_count;
-            let hint_word = &self.free_token_hints[word_index];
-            let mut candidates = hint_word.load(AtomicOrdering::Relaxed);
-            while candidates != 0 {
-                let bit_index = candidates.trailing_zeros() as usize;
-                let bit = 1usize << bit_index;
-                candidates &= !bit;
+        let start_summary = (start_word / FREE_TOKEN_HINT_BITS) % summary_count;
+        for summary_offset in 0..summary_count {
+            let summary_index = (start_summary + summary_offset) % summary_count;
+            let summary = &self.free_hint_word_hints[summary_index];
+            let mut summary_candidates = summary.load(AtomicOrdering::Relaxed);
+            let summary_shift = if summary_index == start_summary {
+                start_word % FREE_TOKEN_HINT_BITS
+            } else {
+                0
+            };
+            if summary_shift != 0 {
+                summary_candidates = summary_candidates.rotate_right(summary_shift as u32);
+            }
+            while summary_candidates != 0 {
+                let rotated_bit_index = summary_candidates.trailing_zeros() as usize;
+                let summary_bit_index =
+                    (rotated_bit_index + summary_shift) % FREE_TOKEN_HINT_BITS;
+                let summary_bit = 1usize << summary_bit_index;
+                let rotated_bit = 1usize << rotated_bit_index;
+                summary_candidates &= !rotated_bit;
 
-                // Claim the advisory bit so concurrent producers do not all
-                // probe the same likely-free token. This RMW is only a hint
-                // claim; the occupancy-token CAS below remains authoritative.
-                let previous = hint_word.fetch_and(!bit, AtomicOrdering::AcqRel);
-                if previous & bit == 0 {
+                // Claiming the summary bit reduces duplicate word probes. It
+                // is advisory just like the token bit; a remaining token bit
+                // is restored below, and a lost bit merely takes the bounded
+                // authoritative repair path.
+                let previous = summary.fetch_and(!summary_bit, AtomicOrdering::Relaxed);
+                if previous & summary_bit == 0 {
                     continue;
                 }
-
-                let token_index = word_index * FREE_TOKEN_HINT_BITS + bit_index;
-                if token_index >= self.capacity {
+                let word_index = summary_index * FREE_TOKEN_HINT_BITS + summary_bit_index;
+                if word_index >= word_count {
                     continue;
                 }
-                slot.token_hint
-                    .store(token_index, AtomicOrdering::Release);
-                if self.occupancy_tokens[token_index]
-                    .state
-                    .compare_exchange(
-                        TOKEN_FREE,
-                        owner | TOKEN_RESERVED_TAG,
-                        AtomicOrdering::AcqRel,
-                        AtomicOrdering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    token_cursor.store(
-                        token_index.wrapping_add(1) % self.capacity,
-                        AtomicOrdering::Relaxed,
-                    );
-                    return Some(token_index);
+                let hint_word = &self.free_token_hints[word_index];
+                let mut candidates = hint_word.load(AtomicOrdering::Relaxed);
+                let token_shift = if word_index == start_word {
+                    start % FREE_TOKEN_HINT_BITS
+                } else {
+                    0
+                };
+                if token_shift != 0 {
+                    candidates = candidates.rotate_right(token_shift as u32);
                 }
-                // The hint was stale or another producer won the CAS. Keep
-                // trying remaining claimed hints before the repair scan.
+                while candidates != 0 {
+                    let rotated_bit_index = candidates.trailing_zeros() as usize;
+                    let bit_index = (rotated_bit_index + token_shift) % FREE_TOKEN_HINT_BITS;
+                    let bit = 1usize << bit_index;
+                    candidates &= !(1usize << rotated_bit_index);
+
+                    // Claim the advisory bit so concurrent producers do not
+                    // all probe the same likely-free token. This RMW is only
+                    // a hint claim; the token CAS remains authoritative.
+                    let previous = hint_word.fetch_and(!bit, AtomicOrdering::Relaxed);
+                    if previous & bit == 0 {
+                        continue;
+                    }
+                    let token_index = word_index * FREE_TOKEN_HINT_BITS + bit_index;
+                    if token_index >= self.capacity {
+                        continue;
+                    }
+                    slot.token_hint
+                        .store(token_index, AtomicOrdering::Release);
+                    if self.occupancy_tokens[token_index]
+                        .state
+                        .compare_exchange(
+                            TOKEN_FREE,
+                            owner | TOKEN_RESERVED_TAG,
+                            AtomicOrdering::Release,
+                            AtomicOrdering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        if hint_word.load(AtomicOrdering::Relaxed) != 0 {
+                            summary.fetch_or(summary_bit, AtomicOrdering::Relaxed);
+                        }
+                        token_cursor.store(
+                            token_index.wrapping_add(1) % self.capacity,
+                            AtomicOrdering::Relaxed,
+                        );
+                        return Some(token_index);
+                    }
+                    // The hint was stale or another producer won the CAS.
+                    // Keep trying remaining claimed hints before repair.
+                }
+                if hint_word.load(AtomicOrdering::Relaxed) != 0 {
+                    summary.fetch_or(summary_bit, AtomicOrdering::Relaxed);
+                }
             }
         }
         None
@@ -484,6 +569,9 @@ impl MpscState {
         for offset in 0..self.capacity {
             let token_index = start.wrapping_add(offset) % self.capacity;
             let token = &self.occupancy_tokens[token_index];
+            if token.state.load(AtomicOrdering::Relaxed) != TOKEN_FREE {
+                continue;
+            }
             // Publish the candidate before attempting the CAS. The hint is
             // deliberately advisory; the consumer validates the token's
             // owner/state before indexing the slot.
@@ -494,8 +582,8 @@ impl MpscState {
                 .compare_exchange(
                     TOKEN_FREE,
                     owner | TOKEN_RESERVED_TAG,
-                    AtomicOrdering::AcqRel,
-                    AtomicOrdering::Acquire,
+                    AtomicOrdering::Release,
+                    AtomicOrdering::Relaxed,
                 )
                 .is_ok()
             {
@@ -549,7 +637,7 @@ impl MpscState {
         };
         let lane = &self.lanes[producer_id as usize];
         let publication = lane.begin_publication(slot_index);
-        let Some(token_index) = self.claim_occupancy_token(owner, slot, &lane.next_token) else {
+        let Some(_token_index) = self.claim_occupancy_token(owner, slot, &lane.next_token) else {
             lane.rollback_publication(publication);
             slot.reset_for_reuse();
             return STATUS_FULL;
@@ -559,18 +647,11 @@ impl MpscState {
             pause();
         }
 
-        // Publication is best effort. The consumer may have selected and
-        // released this token while this producer was paused, in which case
-        // the CAS simply fails. The successful claim above is still the
-        // enqueue's linearization point and must always produce STATUS_OK.
-        let reserved_state = owner | TOKEN_RESERVED_TAG;
-        let published_state = owner | TOKEN_PUBLISHED_TAG;
-        let _ = self.occupancy_tokens[token_index].state.compare_exchange(
-            reserved_state,
-            published_state,
-            AtomicOrdering::AcqRel,
-            AtomicOrdering::Acquire,
-        );
+        // The successful FREE->RESERVED CAS already publishes the fully
+        // copied slot. The consumer accepts RESERVED directly, so a second
+        // RESERVED->PUBLISHED RMW is unnecessary hot-path traffic. Keeping
+        // the PUBLISHED state in the validator preserves compatibility with
+        // any advisory publication transition observed by a future helper.
         STATUS_OK
     }
 
@@ -1152,10 +1233,19 @@ mod tests {
             state.free_token_hints.len(),
             (3 + FREE_TOKEN_HINT_BITS - 1) / FREE_TOKEN_HINT_BITS
         );
+        assert_eq!(
+            state.free_hint_word_hints.len(),
+            (state.free_token_hints.len() + FREE_TOKEN_HINT_BITS - 1)
+                / FREE_TOKEN_HINT_BITS
+        );
         let valid_mask = (1usize << 3) - 1;
         assert_eq!(
             state.free_token_hints[0].load(AtomicOrdering::Relaxed),
             valid_mask
+        );
+        assert_eq!(
+            state.free_hint_word_hints[0].load(AtomicOrdering::Relaxed),
+            1
         );
 
         // Missing hints must repair through the authoritative bounded scan.

@@ -414,3 +414,16 @@ The candidate builds successfully, exports all required ABI symbols, and passes 
 ### Feedback
 Optimize the MPSC hot path until the exact evaluator-shaped benchmark produces a median total_ops_per_sec above 820,458 with valid counters. Profile reservation hint scanning, publication refresh, heap/index maintenance, and atomic traffic, then rerun three trusted repetitions while preserving all correctness behavior.
 
+## Round 5 — Implementer (attempt 2)
+
+### Summary
+
+Optimized the M4 MPSC hot path in `src/lib.rs`. The preallocated per-token advisory hint bitset now has a preallocated hierarchical non-empty-word summary, so common reservations find likely-free words without walking the capacity-sized token array. Hint and summary claims remain lossy atomic metadata; every candidate still requires the authoritative `TOKEN_FREE -> TOKEN_RESERVED` CAS, and empty/stale hints fall back to the bounded token-state repair scan. Producer cursors rotate both summary-word and token-word searches to reduce duplicate hot-token contention. Immutable slot owner codes remove repeated lane/slot arithmetic, and the redundant post-claim `RESERVED -> PUBLISHED` RMW was removed because the consumer already accepts a release-published RESERVED token.
+
+The existing paused-claim, ordering, copied-ownership, undersized-output, capacity 1/2/3/1024 conservation, final-drain, fallback, and hint-repair coverage remains passing. Three consecutive release stress runs passed all 10 tests; final native ABI probes passed for MPSC 1 MiB values, non-word-aligned values, and SPSC/MPMC fallback shapes. Three exact 10-second trusted-native MPSC repetitions reported valid counters and 979,309, 843,463, and 1,697,944 total ops/sec, for a median of 979,309 above the 820,458 baseline. The bundled Go wrapper remains unavailable because its trimmed binary has no configured GOROOT.
+## Round 5 — Implementer (attempt 2)
+- **expected_behavior**: MPSC remains bounded, priority-ordered, copy-safe, allocation-free on successful operations, and correctly handles stale hints, paused claims, draining, and fallback ABI behavior.
+
+### Summary
+Implemented M4 advisory free-token hints with hierarchical summaries, authoritative CAS validation, fallback repair scans, cursor rotation, and reduced atomic traffic. Stress tests, ABI probes, and fallback checks pass; exact 10-second benchmark median reached 979,309 ops/sec. Updated progress.md.
+
