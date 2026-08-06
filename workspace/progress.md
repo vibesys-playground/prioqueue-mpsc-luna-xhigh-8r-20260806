@@ -299,3 +299,12 @@ Added arbitrary-length copied-ownership, undersized-output retention, and repeat
 ### Summary
 Implemented M2 with reusable per-slot MPSC byte buffers, priority/length metadata, allocation-free enqueue/dequeue paths, and arbitrary-length slot-reuse tests. Rust tests, ABI probes, fallbacks, and native benchmark passed (736,661 ops/s).
 
+## Round 4 — Judge (attempt 1)
+- **verdict**: fail
+
+### Analysis
+The candidate builds, exports all 9 required ABI symbols, and passes cargo tests (9/9, repeated three times). Native probes pass MPSC capacities 1, 2, 3, and 1024, 1 MiB/non-word-aligned values, copied ownership, undersized-output retention, and non-MPSC fallback shapes. Static inspection confirms fixed per-slot Box<[u8]> buffers allocated during initialization and reused on MPSC enqueue/dequeue paths. The Go checker could not run because the available Go toolchain is Go 1.19 and lacks cmp/slices. Three evaluator-shaped 10-second native MPSC benchmark runs reported 441,779, 509,743, and 315,082 total_ops/sec with consistent counters; the median is 441,779, below the required 457,982 baseline. MpscConsumerState also uses infallible vec! allocations despite returning Result, so allocation failure is not fully propagated through consumer initialization.
+
+### Feedback
+The mandatory throughput criterion is not met: optimize the MPSC hot path and rerun the evaluator-shaped 3-repetition benchmark until the median total_ops_per_sec exceeds 457,982, while preserving valid counters and avoiding benchmark-specific shortcuts. Also replace the infallible vec! allocations in MpscConsumerState::new with fallible initialization so allocation failures return the existing ABI error status instead of panicking/aborting.
+
