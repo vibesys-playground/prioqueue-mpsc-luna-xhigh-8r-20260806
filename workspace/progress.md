@@ -330,3 +330,10 @@ The candidate builds successfully, exports the required ABI symbols/version, and
 ### Feedback
 
 
+## Round 4 — Framework accuracy gate (attempt 2)
+- **verdict**: pass
+- **command**: `go -C _evaluator/priority-queue run . check --workspace ../.. --scenario mpsc --operations 24 --trials 50`
+
+### Output
+PASS - mpsc linearizable bounded priority queue (50 trials, approximately 24 ops/trial, 4P/1C, capacity=1024, value_size=8)
+
