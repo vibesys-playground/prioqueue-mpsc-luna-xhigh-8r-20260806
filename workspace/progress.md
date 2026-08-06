@@ -231,3 +231,38 @@ Builds successfully and exports the complete ABI. Rust tests, trusted Go tests, 
 ### Output
 PASS - mpsc linearizable bounded priority queue (50 trials, approximately 24 ops/trial, 4P/1C, capacity=1024, value_size=8)
 
+## Round 3 — Framework benchmark (attempt 1)
+- **verdict**: pass
+- **command**: `go -C _evaluator/priority-queue run . benchmark --workspace ../.. --scenario mpsc --repetitions 3`
+- **total_ops_per_sec**: 457982.276466
+
+### Output
+Scenario: mpsc  Repetitions: 3  Median successful ops/s: 457982
+  Samples: [592301.78388 423018.181653 457982.276466]
+Scenario: mpsc  Duration: 10.000s  Prod: 4  Cons: 1
+  Enqueued: 2290496  Full: 963520  Dequeued: 2289472  Empty: 0
+  Successful: 4579968  Attempts: 5543488 (457982 successful ops/s)
+
+__VIBESYS_FRAMEWORK_BENCHMARK_JSON__
+[
+  {
+    "scenario": "mpsc",
+    "enqueued": 2290496,
+    "dropped": 963520,
+    "dequeued": 2289472,
+    "empty": 0,
+    "attempts": 5543488,
+    "duration": 10.00031712,
+    "total_ops_per_sec": 457982.276466,
+    "producers": 4,
+    "consumers": 1,
+    "repetitions": 3,
+    "total_ops_per_sec_samples": [
+      592301.78388,
+      423018.181653,
+      457982.276466
+    ]
+  }
+]
+__VIBESYS_FRAMEWORK_BENCHMARK_JSON_END__
+
