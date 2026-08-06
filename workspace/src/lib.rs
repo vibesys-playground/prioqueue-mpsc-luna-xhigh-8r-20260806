@@ -61,16 +61,33 @@ struct MpscItem {
 }
 
 const SLOT_EMPTY: u8 = 0;
-const SLOT_RESERVED: u8 = 1;
-const SLOT_PUBLISHED: u8 = 2;
+const SLOT_WRITING: u8 = 1;
+const SLOT_READY: u8 = 2;
 
-// The high bit is an internal commit lock. The remaining bits contain the
-// number of committed items. MPSC producers never expose a count change until
-// the corresponding lane slot is ready for acquire readers. Allocation and
-// copying happen before this short atomic commit section; the generic fallback
-// remains the only path with a queue-wide Mutex.
-const OCCUPANCY_LOCK: usize = 1usize << (usize::BITS - 1);
-const OCCUPANCY_MASK: usize = !OCCUPANCY_LOCK;
+// MPSC occupancy is represented by exactly `capacity` independent atomic
+// tokens. The owner and phase are in the same atomic word, so claiming a token
+// is the global capacity reservation linearization point. A RESERVED token is
+// already backed by a fully copied lane item and can be published by the sole
+// consumer if its producer pauses. There is deliberately no queue-wide lock or
+// spin-wait in this protocol.
+const TOKEN_RESERVED_TAG: usize = 1usize << (usize::BITS - 2);
+const TOKEN_PUBLISHED_TAG: usize = 2usize << (usize::BITS - 2);
+const TOKEN_TAG_MASK: usize = 3usize << (usize::BITS - 2);
+const TOKEN_OWNER_MASK: usize = !TOKEN_TAG_MASK;
+const TOKEN_FREE: usize = 0;
+const BIT_WORD_BITS: usize = usize::BITS as usize;
+
+struct MpscOccupancyToken {
+    state: AtomicUsize,
+}
+
+impl MpscOccupancyToken {
+    fn new() -> Self {
+        Self {
+            state: AtomicUsize::new(TOKEN_FREE),
+        }
+    }
+}
 
 struct MpscSlot {
     state: AtomicU8,
@@ -90,13 +107,11 @@ impl MpscSlot {
 // state release/acquire handoff makes the non-atomic item access safe.
 unsafe impl Sync for MpscSlot {}
 
+// A bounded SPSC publication lane: its producer is the producer handle for
+// this lane and its reader is the sole MPSC consumer.
 struct MpscLane {
     slots: Box<[MpscSlot]>,
-    publication_slots: Box<[AtomicUsize]>,
     next_slot: AtomicUsize,
-    next_publication: AtomicUsize,
-    publication_tail: AtomicUsize,
-    publication_head: AtomicUsize,
 }
 
 impl MpscLane {
@@ -108,20 +123,9 @@ impl MpscLane {
         for _ in 0..slot_count {
             slots.push(MpscSlot::new());
         }
-        let mut publication_slots = Vec::new();
-        publication_slots
-            .try_reserve_exact(slot_count)
-            .map_err(|_| STATUS_INTERNAL_ERROR)?;
-        for _ in 0..slot_count {
-            publication_slots.push(AtomicUsize::new(usize::MAX));
-        }
         Ok(Self {
             slots: slots.into_boxed_slice(),
-            publication_slots: publication_slots.into_boxed_slice(),
             next_slot: AtomicUsize::new(0),
-            next_publication: AtomicUsize::new(0),
-            publication_tail: AtomicUsize::new(0),
-            publication_head: AtomicUsize::new(0),
         })
     }
 
@@ -135,7 +139,7 @@ impl MpscLane {
                 .state
                 .compare_exchange(
                     SLOT_EMPTY,
-                    SLOT_RESERVED,
+                    SLOT_WRITING,
                     AtomicOrdering::AcqRel,
                     AtomicOrdering::Acquire,
                 )
@@ -153,14 +157,19 @@ impl MpscLane {
 struct MpscState {
     capacity: usize,
     max_value_size: usize,
-    occupied: AtomicUsize,
+    // `free_count` is only a fast full hint. Token state remains authoritative
+    // while a producer or the consumer is between its two atomic updates.
+    free_count: AtomicUsize,
+    free_hint: AtomicUsize,
+    occupancy_tokens: Box<[MpscOccupancyToken]>,
+    published_bitmap: Box<[AtomicUsize]>,
     lanes: Box<[MpscLane]>,
 }
 
 #[derive(Clone, Copy)]
 struct MpscCandidate {
     priority: u64,
-    sequence: usize,
+    token: usize,
     lane: usize,
     slot: usize,
 }
@@ -168,7 +177,7 @@ struct MpscCandidate {
 impl PartialEq for MpscCandidate {
     fn eq(&self, other: &Self) -> bool {
         self.priority == other.priority
-            && self.sequence == other.sequence
+            && self.token == other.token
             && self.lane == other.lane
             && self.slot == other.slot
     }
@@ -187,28 +196,32 @@ impl Ord for MpscCandidate {
         other
             .priority
             .cmp(&self.priority)
-            .then_with(|| other.sequence.cmp(&self.sequence))
+            .then_with(|| other.token.cmp(&self.token))
             .then_with(|| other.lane.cmp(&self.lane))
             .then_with(|| other.slot.cmp(&self.slot))
     }
 }
 
 struct MpscConsumerState {
-    next_seen: Vec<usize>,
+    seen_bitmap: Vec<usize>,
     heap: BinaryHeap<MpscCandidate>,
 }
 
 impl MpscConsumerState {
-    fn new(lane_count: usize, capacity: usize) -> Result<Self, u32> {
-        let mut next_seen = Vec::new();
-        next_seen
-            .try_reserve_exact(lane_count)
+    fn new(capacity: usize) -> Result<Self, u32> {
+        let bitmap_words = capacity
+            .checked_add(BIT_WORD_BITS - 1)
+            .ok_or(STATUS_INTERNAL_ERROR)?
+            / BIT_WORD_BITS;
+        let mut seen_bitmap = Vec::new();
+        seen_bitmap
+            .try_reserve_exact(bitmap_words)
             .map_err(|_| STATUS_INTERNAL_ERROR)?;
-        next_seen.resize(lane_count, 0);
+        seen_bitmap.resize(bitmap_words, 0);
         let mut heap = BinaryHeap::new();
         heap.try_reserve_exact(capacity)
             .map_err(|_| STATUS_INTERNAL_ERROR)?;
-        Ok(Self { next_seen, heap })
+        Ok(Self { seen_bitmap, heap })
     }
 }
 
@@ -222,7 +235,11 @@ impl MpscState {
             .checked_add(1)
             .ok_or(STATUS_INTERNAL_ERROR)?;
         let lane_count = usize::try_from(producer_count).map_err(|_| STATUS_INVALID)?;
-        if capacity >= OCCUPANCY_LOCK {
+
+        let owner_count = lane_count
+            .checked_mul(slot_count)
+            .ok_or(STATUS_INTERNAL_ERROR)?;
+        if owner_count > TOKEN_OWNER_MASK {
             return Err(STATUS_INVALID);
         }
         let mut lanes = Vec::new();
@@ -232,76 +249,163 @@ impl MpscState {
         for _ in 0..lane_count {
             lanes.push(MpscLane::new(slot_count)?);
         }
+
+        let mut occupancy_tokens = Vec::new();
+        occupancy_tokens
+            .try_reserve_exact(capacity)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        for _ in 0..capacity {
+            occupancy_tokens.push(MpscOccupancyToken::new());
+        }
+
+        let bitmap_words = capacity
+            .checked_add(BIT_WORD_BITS - 1)
+            .ok_or(STATUS_INTERNAL_ERROR)?
+            / BIT_WORD_BITS;
+        let mut published_bitmap = Vec::new();
+        published_bitmap
+            .try_reserve_exact(bitmap_words)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        for _ in 0..bitmap_words {
+            published_bitmap.push(AtomicUsize::new(0));
+        }
+
         Ok(Self {
             capacity,
             max_value_size,
-            occupied: AtomicUsize::new(0),
+            free_count: AtomicUsize::new(capacity),
+            free_hint: AtomicUsize::new(0),
+            occupancy_tokens: occupancy_tokens.into_boxed_slice(),
+            published_bitmap: published_bitmap.into_boxed_slice(),
             lanes: lanes.into_boxed_slice(),
         })
     }
 
-    fn acquire_occupancy_lock(&self) -> usize {
-        loop {
-            let occupied = self.occupied.load(AtomicOrdering::Acquire);
-            if occupied & OCCUPANCY_LOCK != 0 {
-                std::hint::spin_loop();
-                continue;
-            }
-            match self.occupied.compare_exchange_weak(
-                occupied,
-                occupied | OCCUPANCY_LOCK,
-                AtomicOrdering::AcqRel,
-                AtomicOrdering::Acquire,
-            ) {
-                Ok(_) => return occupied | OCCUPANCY_LOCK,
-                Err(_) => continue,
-            }
+    fn owner_code(&self, lane: usize, slot: usize) -> Result<usize, u32> {
+        let linear = lane
+            .checked_mul(self.lanes[lane].slots.len())
+            .and_then(|value| value.checked_add(slot))
+            .and_then(|value| value.checked_add(1))
+            .ok_or(STATUS_INTERNAL_ERROR)?;
+        if linear > TOKEN_OWNER_MASK {
+            Err(STATUS_INTERNAL_ERROR)
+        } else {
+            Ok(linear)
         }
     }
 
-    fn unlock_occupancy(&self) {
-        loop {
-            let occupied = self.occupied.load(AtomicOrdering::Acquire);
-            if occupied & OCCUPANCY_LOCK == 0 {
-                return;
-            }
-            if self
-                .occupied
-                .compare_exchange_weak(
-                    occupied,
-                    occupied & OCCUPANCY_MASK,
-                    AtomicOrdering::Release,
-                    AtomicOrdering::Acquire,
-                )
-                .is_ok()
-            {
-                return;
-            }
+    fn decode_owner(&self, owner: usize) -> Result<(usize, usize), u32> {
+        if owner == 0 {
+            return Err(STATUS_INTERNAL_ERROR);
         }
+        let linear = owner - 1;
+        let lane = linear / self.lanes[0].slots.len();
+        let slot = linear % self.lanes[0].slots.len();
+        if lane >= self.lanes.len() {
+            return Err(STATUS_INTERNAL_ERROR);
+        }
+        Ok((lane, slot))
     }
 
-    fn release_occupancy(&self) {
-        loop {
-            let occupied = self.occupied.load(AtomicOrdering::Acquire);
-            if occupied & OCCUPANCY_LOCK != 0 {
-                std::hint::spin_loop();
-                continue;
-            }
-            let count = occupied & OCCUPANCY_MASK;
-            debug_assert!(count > 0);
-            if self
-                .occupied
-                .compare_exchange_weak(
-                    occupied,
-                    count.saturating_sub(1),
+    fn bitmap_parts(token: usize) -> (usize, usize) {
+        let word = token / BIT_WORD_BITS;
+        let bit = 1usize << (token % BIT_WORD_BITS);
+        (word, bit)
+    }
+
+    fn mark_published(&self, token: usize) {
+        let (word, bit) = Self::bitmap_parts(token);
+        self.published_bitmap[word].fetch_or(bit, AtomicOrdering::Release);
+    }
+
+    fn clear_published(&self, token: usize) {
+        let (word, bit) = Self::bitmap_parts(token);
+        self.published_bitmap[word].fetch_and(!bit, AtomicOrdering::AcqRel);
+    }
+
+    fn claim_occupancy_token(&self, owner: usize) -> Option<usize> {
+        // A zero count is a valid, nonblocking full result. It cannot hide a
+        // completed dequeue because the consumer increments it before making
+        // its token FREE. A producer that has claimed a token but has not yet
+        // decremented the hint merely contributes an in-flight enqueue, which
+        // may be linearized before this FULL response.
+        if self.free_count.load(AtomicOrdering::Acquire) == 0 {
+            return None;
+        }
+
+        let start = self.free_hint.load(AtomicOrdering::Relaxed) % self.capacity;
+        for offset in 0..self.capacity {
+            let token_index = (start + offset) % self.capacity;
+            let token = &self.occupancy_tokens[token_index];
+            if token
+                .state
+                .compare_exchange(
+                    TOKEN_FREE,
+                    owner | TOKEN_RESERVED_TAG,
                     AtomicOrdering::AcqRel,
                     AtomicOrdering::Acquire,
                 )
                 .is_ok()
             {
-                return;
+                self.free_count.fetch_sub(1, AtomicOrdering::AcqRel);
+                self.free_hint
+                    .store((token_index + 1) % self.capacity, AtomicOrdering::Relaxed);
+                return Some(token_index);
             }
         }
+        None
+    }
+
+    fn publish_reserved_token(&self, token_index: usize, state: usize) -> Result<(), u32> {
+        let tag = state & TOKEN_TAG_MASK;
+        if tag != TOKEN_RESERVED_TAG && tag != TOKEN_PUBLISHED_TAG {
+            return Err(STATUS_INTERNAL_ERROR);
+        }
+        let owner = state & TOKEN_OWNER_MASK;
+        let (lane_index, slot_index) = self.decode_owner(owner)?;
+        let slot = &self.lanes[lane_index].slots[slot_index];
+        if slot.state.load(AtomicOrdering::Acquire) != SLOT_READY {
+            return Err(STATUS_INTERNAL_ERROR);
+        }
+
+        let published_state = owner | TOKEN_PUBLISHED_TAG;
+        if tag == TOKEN_RESERVED_TAG {
+            let _ = self.occupancy_tokens[token_index].state.compare_exchange(
+                state,
+                published_state,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            );
+        }
+        let final_state = self.occupancy_tokens[token_index]
+            .state
+            .load(AtomicOrdering::Acquire);
+        if final_state & TOKEN_TAG_MASK != TOKEN_PUBLISHED_TAG
+            || final_state & TOKEN_OWNER_MASK != owner
+        {
+            return Err(STATUS_INTERNAL_ERROR);
+        }
+        self.mark_published(token_index);
+        Ok(())
+    }
+
+    // This bounded pass is needed only when the consumer's published bitmap is
+    // empty. It closes the RESERVED/PUBLISHED publication gap without waiting
+    // for the producer that created it.
+    fn help_pending_publications(&self) -> Result<(), u32> {
+        for token_index in 0..self.capacity {
+            let state = self.occupancy_tokens[token_index]
+                .state
+                .load(AtomicOrdering::Acquire);
+            match state & TOKEN_TAG_MASK {
+                TOKEN_RESERVED_TAG | TOKEN_PUBLISHED_TAG => {
+                    self.publish_reserved_token(token_index, state)?;
+                }
+                TOKEN_FREE => {}
+                _ => return Err(STATUS_INTERNAL_ERROR),
+            }
+        }
+        Ok(())
     }
 
     fn try_enqueue_impl(
@@ -310,6 +414,7 @@ impl MpscState {
         priority: u64,
         data: &[u8],
         pause_after_lane_reservation: Option<&dyn Fn()>,
+        pause_after_occupancy_reservation: Option<&dyn Fn()>,
     ) -> u32 {
         if data.len() > self.max_value_size {
             return STATUS_INVALID;
@@ -333,44 +438,60 @@ impl MpscState {
         unsafe {
             *slot.item.get() = Some(MpscItem { priority, value });
         }
-        let locked = self.acquire_occupancy_lock();
-        let count = locked & OCCUPANCY_MASK;
-        if count >= self.capacity {
-            self.unlock_occupancy();
-            slot.state.store(SLOT_EMPTY, AtomicOrdering::Release);
+
+        // The item is complete before it can consume one of the global
+        // capacity tokens. A RESERVED token therefore always has safe data for
+        // another operation to publish.
+        slot.state.store(SLOT_READY, AtomicOrdering::Release);
+        let owner = match self.owner_code(producer_id as usize, slot_index) {
+            Ok(owner) => owner,
+            Err(status) => {
+                let item = unsafe { (*slot.item.get()).take() };
+                drop(item);
+                slot.state.store(SLOT_EMPTY, AtomicOrdering::Release);
+                return status;
+            }
+        };
+        let Some(token_index) = self.claim_occupancy_token(owner) else {
             let item = unsafe { (*slot.item.get()).take() };
             drop(item);
+            slot.state.store(SLOT_EMPTY, AtomicOrdering::Release);
             return STATUS_FULL;
+        };
+
+        if let Some(pause) = pause_after_occupancy_reservation {
+            pause();
         }
-        self.occupied.store(
-            (count + 1) | OCCUPANCY_LOCK,
-            AtomicOrdering::Release,
+
+        let reserved_state = owner | TOKEN_RESERVED_TAG;
+        let published_state = owner | TOKEN_PUBLISHED_TAG;
+        let _ = self.occupancy_tokens[token_index].state.compare_exchange(
+            reserved_state,
+            published_state,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
         );
-        let publication_sequence = lane.next_publication.load(AtomicOrdering::Relaxed);
-        let publication_head = lane.publication_head.load(AtomicOrdering::Acquire);
-        if publication_sequence.wrapping_sub(publication_head)
-            >= lane.publication_slots.len()
-        {
-            self.occupied.store(count | OCCUPANCY_LOCK, AtomicOrdering::Release);
-            self.unlock_occupancy();
-            slot.state.store(SLOT_EMPTY, AtomicOrdering::Release);
-            let item = unsafe { (*slot.item.get()).take() };
-            drop(item);
-            return STATUS_INTERNAL_ERROR;
+        // A consumer may have helped and even drained this token while the
+        // producer was paused. The successful reservation still belongs to
+        // this enqueue, so returning OK remains correct.
+        let final_state = self.occupancy_tokens[token_index]
+            .state
+            .load(AtomicOrdering::Acquire);
+        if final_state == TOKEN_FREE || final_state & TOKEN_OWNER_MASK != owner {
+            // The sole consumer may have helped and drained this item, and a
+            // different producer may even have reused the token before this
+            // paused call resumed. The original claim still completed this
+            // enqueue successfully.
+            return STATUS_OK;
         }
-        lane.next_publication
-            .store(publication_sequence.wrapping_add(1), AtomicOrdering::Relaxed);
-        slot.state.store(SLOT_PUBLISHED, AtomicOrdering::Release);
-        lane.publication_slots[publication_sequence % lane.publication_slots.len()]
-            .store(slot_index, AtomicOrdering::Release);
-        lane.publication_tail
-            .store(publication_sequence.wrapping_add(1), AtomicOrdering::Release);
-        self.unlock_occupancy();
+        if let Err(status) = self.publish_reserved_token(token_index, final_state) {
+            return status;
+        }
         STATUS_OK
     }
 
     fn try_enqueue(&self, producer_id: u32, priority: u64, data: &[u8]) -> u32 {
-        self.try_enqueue_impl(producer_id, priority, data, None)
+        self.try_enqueue_impl(producer_id, priority, data, None, None)
     }
 
     #[cfg(test)]
@@ -386,22 +507,45 @@ impl MpscState {
             reached.wait();
             resume.wait();
         };
-        self.try_enqueue_impl(producer_id, priority, data, Some(&pause))
+        self.try_enqueue_impl(producer_id, priority, data, Some(&pause), None)
+    }
+
+    #[cfg(test)]
+    fn try_enqueue_paused_after_occupancy_reservation(
+        &self,
+        producer_id: u32,
+        priority: u64,
+        data: &[u8],
+        reached: &std::sync::Barrier,
+        resume: &std::sync::Barrier,
+    ) -> u32 {
+        let pause = || {
+            reached.wait();
+            resume.wait();
+        };
+        self.try_enqueue_impl(producer_id, priority, data, None, Some(&pause))
     }
 
     fn ingest_published(&self, consumer: &mut MpscConsumerState) -> Result<(), u32> {
-        for (lane_index, lane) in self.lanes.iter().enumerate() {
-            let tail = lane.publication_tail.load(AtomicOrdering::Acquire);
-            let mut next = consumer.next_seen[lane_index];
-            while next < tail {
-                let publication_index = next % lane.publication_slots.len();
-                let slot_index = lane.publication_slots[publication_index]
-                    .load(AtomicOrdering::Acquire);
-                if slot_index == usize::MAX || slot_index >= lane.slots.len() {
+        for (word_index, word) in self.published_bitmap.iter().enumerate() {
+            let mut new_tokens =
+                word.load(AtomicOrdering::Acquire) & !consumer.seen_bitmap[word_index];
+            while new_tokens != 0 {
+                let bit_offset = new_tokens.trailing_zeros() as usize;
+                let bit = 1usize << bit_offset;
+                let token_index = word_index * BIT_WORD_BITS + bit_offset;
+                if token_index >= self.capacity {
                     return Err(STATUS_INTERNAL_ERROR);
                 }
-                let slot = &lane.slots[slot_index];
-                if slot.state.load(AtomicOrdering::Acquire) != SLOT_PUBLISHED {
+                let state = self.occupancy_tokens[token_index]
+                    .state
+                    .load(AtomicOrdering::Acquire);
+                if state & TOKEN_TAG_MASK != TOKEN_PUBLISHED_TAG {
+                    return Err(STATUS_INTERNAL_ERROR);
+                }
+                let (lane_index, slot_index) = self.decode_owner(state & TOKEN_OWNER_MASK)?;
+                let slot = &self.lanes[lane_index].slots[slot_index];
+                if slot.state.load(AtomicOrdering::Acquire) != SLOT_READY {
                     return Err(STATUS_INTERNAL_ERROR);
                 }
                 let priority = unsafe {
@@ -412,16 +556,13 @@ impl MpscState {
                 };
                 consumer.heap.push(MpscCandidate {
                     priority,
-                    sequence: next,
+                    token: token_index,
                     lane: lane_index,
                     slot: slot_index,
                 });
-                lane.publication_slots[publication_index]
-                    .store(usize::MAX, AtomicOrdering::Release);
-                next = next.wrapping_add(1);
+                consumer.seen_bitmap[word_index] |= bit;
+                new_tokens &= !bit;
             }
-            lane.publication_head.store(next, AtomicOrdering::Release);
-            consumer.next_seen[lane_index] = tail;
         }
         Ok(())
     }
@@ -442,6 +583,10 @@ impl MpscState {
         consumer: &mut MpscConsumerState,
     ) -> Result<usize, u32> {
         self.ingest_published(consumer)?;
+        if consumer.heap.is_empty() {
+            self.help_pending_publications()?;
+            self.ingest_published(consumer)?;
+        }
         let Some((slot, _candidate)) = self.minimum_published_slot(consumer) else {
             return Err(STATUS_EMPTY);
         };
@@ -456,15 +601,25 @@ impl MpscState {
             return Err(STATUS_INVALID);
         }
 
-        let _ = consumer.heap.pop();
+        let candidate = consumer.heap.pop().ok_or(STATUS_INTERNAL_ERROR)?;
         let item = unsafe { (*slot.item.get()).take() }.ok_or(STATUS_INTERNAL_ERROR)?;
         output[..value_length].copy_from_slice(&item.value);
         drop(item);
         slot.state.store(SLOT_EMPTY, AtomicOrdering::Release);
-        self.release_occupancy();
+        let (word, bit) = Self::bitmap_parts(candidate.token);
+        consumer.seen_bitmap[word] &= !bit;
+        self.clear_published(candidate.token);
+        // Make the abstract dequeue's capacity release visible before making
+        // the token claimable. This ordering makes a stale FREE hint unable to
+        // create a strict-MPSC FULL followed by EMPTY contradiction.
+        self.free_count.fetch_add(1, AtomicOrdering::AcqRel);
+        self.occupancy_tokens[candidate.token]
+            .state
+            .store(TOKEN_FREE, AtomicOrdering::Release);
+        self.free_hint
+            .store(candidate.token, AtomicOrdering::Relaxed);
         Ok(value_length)
     }
-
 }
 
 enum Backend {
@@ -526,10 +681,7 @@ impl Queue {
             return Err(STATUS_INVALID);
         }
         let mpsc = match self.backend.as_ref() {
-            Backend::Mpsc(state) => Some(MpscConsumerState::new(
-                state.lanes.len(),
-                state.capacity,
-            )?),
+            Backend::Mpsc(state) => Some(MpscConsumerState::new(state.capacity)?),
             Backend::Generic(_) => None,
         };
         Ok(Consumer {
@@ -585,6 +737,22 @@ impl Producer {
     ) -> u32 {
         match self.backend.as_ref() {
             Backend::Mpsc(state) => state.try_enqueue_paused_after_lane_reservation(
+                self.id, priority, data, reached, resume,
+            ),
+            Backend::Generic(_) => STATUS_INTERNAL_ERROR,
+        }
+    }
+
+    #[cfg(test)]
+    fn try_enqueue_paused_after_occupancy_reservation(
+        &self,
+        priority: u64,
+        data: &[u8],
+        reached: &std::sync::Barrier,
+        resume: &std::sync::Barrier,
+    ) -> u32 {
+        match self.backend.as_ref() {
+            Backend::Mpsc(state) => state.try_enqueue_paused_after_occupancy_reservation(
                 self.id, priority, data, reached, resume,
             ),
             Backend::Generic(_) => STATUS_INTERNAL_ERROR,
@@ -706,6 +874,61 @@ mod tests {
             assert_eq!(consumer.try_dequeue(&mut output), Ok(6));
             assert_eq!(&output[..6], b"paused");
             assert_eq!(consumer.try_dequeue(&mut output), Err(STATUS_EMPTY));
+        });
+    }
+
+    #[test]
+    fn mpsc_paused_occupancy_commit_does_not_block_other_calls() {
+        use std::sync::{mpsc, Arc as TestArc, Barrier};
+        use std::thread;
+        use std::time::Duration;
+
+        let queue = Queue::new(1, 8, 2, 1).unwrap();
+        let producer0 = queue.producer(0).unwrap();
+        let producer1 = queue.producer(1).unwrap();
+        let consumer = queue.consumer(0).unwrap();
+        let reached = TestArc::new(Barrier::new(2));
+        let resume = TestArc::new(Barrier::new(2));
+        let producer_reached = TestArc::clone(&reached);
+        let producer_resume = TestArc::clone(&resume);
+
+        thread::scope(|scope| {
+            let paused = scope.spawn(move || {
+                producer0.try_enqueue_paused_after_occupancy_reservation(
+                    10,
+                    b"paused",
+                    &producer_reached,
+                    &producer_resume,
+                )
+            });
+            reached.wait();
+
+            let (enqueue_tx, enqueue_rx) = mpsc::channel();
+            scope.spawn(move || {
+                enqueue_tx
+                    .send(producer1.try_enqueue(1, b"other"))
+                    .unwrap();
+            });
+            assert_eq!(
+                enqueue_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+                STATUS_FULL
+            );
+
+            let (dequeue_tx, dequeue_rx) = mpsc::channel();
+            scope.spawn(move || {
+                let mut consumer = consumer;
+                let mut output = [0_u8; 8];
+                let result = consumer.try_dequeue(&mut output);
+                dequeue_tx.send((result, output)).unwrap();
+            });
+            let (result, output) = dequeue_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            assert_eq!(result, Ok(6));
+            assert_eq!(&output[..6], b"paused");
+
+            // Neither the FULL enqueue nor the dequeue waited for the paused
+            // producer to finish its publication step.
+            resume.wait();
+            assert_eq!(paused.join().unwrap(), STATUS_OK);
         });
     }
 

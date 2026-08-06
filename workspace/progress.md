@@ -59,3 +59,16 @@ The shared library builds, exports the required ABI, and Rust tests pass. Native
 ### Feedback
 Replace OCCUPANCY_LOCK and its acquire/unlock spin loops with a genuinely nonblocking occupancy/publication protocol. No producer or consumer should depend on a holder reaching the end of a global commit section; use atomic reservation/publication state transitions with bounded failure, rollback, or helping while preserving strict MPSC FULL/EMPTY linearizability. Add an adversarial test that pauses an enqueue during publication/occupancy commit and verifies concurrent enqueue/dequeue calls still return without waiting.
 
+## Round 2 — Implementer summary
+
+Replaced the MPSC `OCCUPANCY_LOCK` spin-lock protocol in `src/lib.rs` with exactly `capacity` independent atomic occupancy tokens. A producer copies into its private bounded SPSC lane slot before atomically claiming a token; RESERVED tokens encode their owner and can be publish-helped by the sole consumer, while release/acquire slot and token transitions preserve copied ownership. A published-token bitmap feeds a consumer-local minimum-priority heap, so producers do not touch a queue-wide mutex and normal dequeue avoids a full lane scan. The generic mutex-backed binary-heap fallback remains selected for every non-MPSC configuration, and the C ABI is unchanged.
+
+Added `mpsc_paused_occupancy_commit_does_not_block_other_calls`, which pauses a capacity-1 producer after occupancy reservation and verifies a concurrent FULL enqueue and a consumer dequeue both return within a timeout; the consumer returns the paused item by helping its publication. Existing capacity-1 unpublished-reservation, priority/ownership, and concurrent conservation tests remain passing.
+
+Validation: `cargo test --release` passed all five Rust tests; `make` rebuilt `priority-queue-candidate.so`; native probes passed MPSC capacity 1, copied values, and SPSC/MPMC-shaped fallback configurations. The trusted native MPSC benchmark reported nonzero throughput of approximately 2.17 million successful operations/second in the final 0.5-second run (a prior 1-second run measured approximately 3.18 million versus approximately 1.01 million for the bundled mutex reference). The Go evaluator could not run because this environment has a trimmed Go binary with no configured GOROOT.
+## Round 1 — Implementer (attempt 3)
+- **expected_behavior**: MPSC operations remain linearizable, bounded, copied-value safe, priority ordered, and nonblocking during paused publication. Non-MPSC configurations retain the mutex-backed fallback.
+
+### Summary
+Replaced OCCUPANCY_LOCK with nonblocking atomic occupancy tokens, helper-published reservations, bitmap-backed consumer priority selection, and bounded per-producer lanes. Added an adversarial paused-commit test and preserved fallback/C ABI behavior. Rust tests, native probes, and benchmarks pass; progress.md updated.
+
