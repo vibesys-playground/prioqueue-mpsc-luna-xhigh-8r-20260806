@@ -241,6 +241,28 @@ PASS - mpsc linearizable bounded priority queue (50 trials, approximately 24 ops
 
 ## M5 — Implementer summary
 
+Moved MPSC lane publication-tail advancement until after the authoritative
+`FREE -> RESERVED` token CAS, closing the active-lane lost-signal window where
+a consumer could clear a hint after refreshing an already-advanced tail but
+before the producer claimed capacity. Active-lane hints are preallocated and
+the consumer incrementally refreshes only signaled lanes, plus the lane whose
+item was dequeued; hint clearing rechecks publication tails before and after
+the bit clear. Missing/stale hints use bounded lane-tail and slot/token repair,
+while token owner/state validation remains authoritative. Removed redundant
+slot metadata resets and skipped repeated active/free hint RMWs where the bit
+was already set; all successful MPSC operations remain allocation-free.
+
+Added coverage for publication records paused before token claim, active-hint
+repair, paused-after-claim progress, undersized output retention, priority,
+copied ownership, capacities 1/2/3/1024, repeated conservation, and final
+drain. `cargo test --release --locked` passed 12 tests repeatedly; native ABI
+probes passed MPSC capacities 1/2/3/1024, fallback worker shapes, 37-byte and
+1 MiB values, and the complete exported ABI symbol set. Native 10-second MPSC
+samples reached 1.64M and 2.09M total ops/sec in this environment, with
+expected host scheduling variance.
+
+## M5 — Implementer summary
+
 Added preallocated hierarchical advisory active-lane hints to the MPSC backend. Producers signal their lane after a successful authoritative occupancy-token claim, before the paused-claim hook can block; the sole consumer incrementally refreshes only signaled lanes and the lane just dequeued before consulting the local minimum-priority heap. Hint clearing batches stable lane bits, rechecks publication tails before and after the clear, and re-signals lanes whose publication progress raced the clear. The existing authoritative token owner/state validation and bounded missing/stale-hint repair remain intact. Consumer tail observations are preallocated, so successful enqueue/dequeue operations remain allocation-free; the generic fallback and copying ABI are unchanged.
 
 Added active-hint repair coverage and strengthened paused-claim hint assertions. Repeated Rust stress covers capacities 1, 2, 3, and 1024 with copied-value conservation, priority ordering, undersized-output retention, paused-claim progress, and final drain. `cargo test --release --locked` passes all 11 tests. The final shared library exports the complete ABI and native probes pass MPSC capacities 1/2/3/1024, 37-byte and 1 MiB values, SPSC fallback, and MPMC fallback. Evaluator-shaped native samples were variable on the host, with several valid 1-second samples above 2M successful ops/sec; the 10-second sample reported valid counters and 1.17M successful ops/sec. The bundled Go evaluator remains unavailable because its trimmed Go binary has no configured GOROOT.
@@ -519,4 +541,9 @@ The library builds successfully and exports the required ABI. All 11 Rust tests 
 
 ### Feedback
 Optimize the MPSC hot path until the exact trusted benchmark median exceeds 1,598,401 total_ops_per_sec. Additionally, close the active-lane lost-signal race: clearing must revalidate authoritative token/publication state or use a sequence/state protocol that cannot clear a signal for a token claimed after the refresh, otherwise a queued low-priority item can be skipped while other heap entries remain.
+## Round 6 — Implementer (attempt 2)
+- **expected_behavior**: MPSC queues preserve priority ordering, copied ownership, exact-once conservation, paused-claim progress, FULL/EMPTY semantics, undersized-output retention, and final drain across capacities 1, 2, 3, and 1024.
+
+### Summary
+Implemented M5 with race-safe publication tails, incremental active-lane hint refresh, bounded repair, authoritative token validation, allocation-free operations, stress coverage, and preserved ABI/fallback behavior. Tests and native probes pass.
 
