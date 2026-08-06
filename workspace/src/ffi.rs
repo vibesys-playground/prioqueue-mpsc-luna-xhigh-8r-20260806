@@ -124,7 +124,7 @@ pub unsafe extern "C" fn vspq_try_dequeue(
     output_capacity: u64,
     output_length: *mut u64,
 ) -> u32 {
-    let Some(consumer) = (unsafe { consumer.as_ref() }) else {
+    let Some(consumer) = (unsafe { consumer.as_mut() }) else {
         return STATUS_INVALID;
     };
     if output_length.is_null() {

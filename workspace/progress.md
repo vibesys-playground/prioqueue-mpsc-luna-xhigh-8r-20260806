@@ -39,3 +39,14 @@ Build, ABI export, Rust tests, evaluator tests, native probes, the exact 50-tria
 ### Feedback
 Fix the MPSC reservation/publication protocol so FULL and EMPTY cannot observe contradictory states during an in-flight enqueue. In particular, do not make capacity reservations visible to strict-MPSC FULL responses while the item remains unpublished, or add a nonblocking commit protocol that preserves linearizability. Add an adversarial capacity-1 test covering: successful enqueue paused after reservation, concurrent FULL enqueue, then EMPTY dequeue before publication.
 
+## Round 2 — Implementer summary
+
+Reworked `src/lib.rs` so MPSC enqueue copies into a producer-owned bounded lane slot before taking the atomic occupancy commit section. Occupancy count and release/acquire slot publication are now ordered coherently, while the generic `Mutex<BinaryHeap>` backend remains selected for every non-MPSC configuration. Added bounded per-lane publication-record rings and a consumer-local minimum-priority heap, so dequeue no longer scans every lane slot on each operation. Added a capacity-1 paused lane-reservation test covering the unpublished/full/empty boundary, plus copied-value and concurrent conservation coverage.
+
+Validation: `cargo test --release` passed (four tests, including repeated concurrency runs); native probes passed for MPSC, SPSC, MPMC-shaped configurations, capacity 1, and 1 MiB values; the shared library builds and exports the documented ABI. A native MPSC benchmark measured about 985k successful operations/second versus about 689k for the bundled single-mutex reference in the same run. Go evaluator tests remain unavailable because the environment’s trimmed Go binary has no configured GOROOT.
+## Round 1 — Implementer (attempt 2)
+- **expected_behavior**: MPSC queues remain bounded and linearizable with priority ordering, copied values, conservation, and correct FULL/EMPTY behavior. Native benchmark throughput improves over the mutex baseline.
+
+### Summary
+Implemented the MPSC lane backend, atomic occupancy publication, consumer min-heap, ownership copying, drain semantics, and capacity-1 adversarial test. Preserved generic fallback and C ABI.
+
