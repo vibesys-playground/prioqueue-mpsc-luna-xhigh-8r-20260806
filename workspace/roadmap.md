@@ -71,8 +71,9 @@ acceptance"); read it before parking or abandoning.
 - [x] M1 `done` (rounds 1-2): Replace the queue-wide producer mutex for the MPSC configuration with per-producer bounded SPSC publication lanes plus an atomic global occupancy reservation; the corrective slice made occupancy token state authoritative for publication. Why: the structural producer-contention win is now linearizable and passed the trusted evaluator after removing the stale bitmap/commit protocol.
 - [x] M2 `done` (round 4): Make MPSC slot payload storage reusable and allocation-free after initialization, while retaining the required copy semantics for arbitrary configured value sizes. Why: fixed per-slot buffers remove successful-operation payload allocation while preserving copied ownership and metadata reset on reuse.
 - [x] M3 `done` (round 3): Optimize consumer-side minimum-priority selection over producer heads with a maintained head index/heap and cache-friendly slot layout. Why: the consumer-local publication index removed the ordinary capacity-wide token scan while preserving authoritative token validation; the trusted median rose to 457,982 total_ops_per_sec.
-- [ ] M4 `in_progress` (round 1): Add a bounded advisory free-token hint bitset so common MPSC producer reservations avoid scanning all capacity tokens, while authoritative token CAS and a repair scan preserve correctness. Why: the near-full benchmark still spends failed enqueue attempts probing the 1024-token occupancy array; O(1)-ish hint acquisition should reduce producer-side atomic and cache traffic.
-- [ ] M5 `todo`: Reduce consumer head-index refresh and stale heap maintenance to an active-lane/incremental path. Why: after producer token acquisition is addressed, refreshing every producer lane and validating heap candidates on every dequeue is the remaining consumer-side overhead visible in the current implementation.
+- [x] M4 `done` (rounds 5-7): Add a bounded hierarchical advisory free-token hint bitset so common MPSC producer reservations avoid scanning all capacity tokens, while authoritative token CAS and repair scans preserve correctness. Why: the producer-side near-full reservation probe was reduced to cache-local hint-word traffic; the trusted framework benchmark reached 1,721,874 total_ops_per_sec and the accuracy gate passed.
+- [x] M6 `done` (rounds 6-7): Optimize release-side free-token hint replenishment to one leaf-word atomic RMW, restoring the summary only when the leaf was previously empty. Why: dequeue-side hint publication is on every successful operation, so removing the redundant summary traffic lowers consumer cache/atomic overhead without changing advisory semantics.
+- [ ] M5 `in_progress` (round 1): Reduce consumer head-index refresh and stale heap maintenance to an active-lane/incremental path, beginning with consumer-local publication-tail gating and an explicit repair-only tail witness. Why: the current dequeue path refreshes every lane and rechecks its newest publication record even when no lane tail changed; skipping that work on stable lanes should reduce consumer atomic/cache traffic while retaining paused-publication recovery.
 
 ## Minor
 
@@ -84,6 +85,8 @@ acceptance"); read it before parking or abandoning.
 - M3: trusted judge and accuracy gate passed in Round 3; latest benchmark median was 457,982 total_ops_per_sec.
 - M2: fallible consumer-index initialization, reusable slot buffers, repeated arbitrary-length ownership tests, and a native three-repetition benchmark median above 457,982 passed in Round 4.
 - N1: paused-claim, capacity-1/2/3 stress, ownership, conservation, and drain gates passed in Round 2.
+- M4: hierarchical advisory token hints, authoritative repair, and the trusted MPSC benchmark/accuracy gates passed in Round 5.
+- M6: release-side hint replenishment and focused stale-summary tests passed in Round 7; the trusted raw benchmark median exceeded the strict prior threshold.
 
 ## Parked
 

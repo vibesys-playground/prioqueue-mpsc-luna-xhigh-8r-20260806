@@ -239,6 +239,12 @@ Builds successfully and exports the complete ABI. Rust tests, trusted Go tests, 
 ### Output
 PASS - mpsc linearizable bounded priority queue (50 trials, approximately 24 ops/trial, 4P/1C, capacity=1024, value_size=8)
 
+## M5 slice — Implementer summary
+
+Added fixed consumer-local per-lane publication-tail snapshots and clean/pending repair state to the MPSC consumer. Stable lanes with an unchanged publication tail and no pending repair now skip publication-record traversal and tail-witness validation; changed lanes incrementally catch up from their existing read cursor. Record mismatches, overwritten records, READY-without-token observations, and paused publication states retain bounded authoritative repair, while occupancy tokens, advisory free-token hints, reusable payload buffers, priority heap selection, fallback behavior, and the ABI remain unchanged.
+
+Added focused paused-after-publication coverage for repair-state recovery, changed-lane catch-up, authoritative FULL, undersized-output retention, copied ownership, priority ordering, and final drain. Release Rust tests passed 13 tests in five consecutive runs. The shared ABI probes passed MPSC capacities 1, 2, 3, and 1024, SPSC/SPMC/MPMC fallback shapes, and 1 MiB values; the exported v1 symbols remain intact. Native benchmark samples were valid and variable, with a three-run median above 1.72M total operations/second. `cargo fmt` was unavailable because rustfmt is not installed in the toolchain; the source was kept formatted manually.
+
 ## Round 3 — Framework benchmark (attempt 1)
 - **verdict**: pass
 - **command**: `go -C _evaluator/priority-queue run . benchmark --workspace ../.. --scenario mpsc --repetitions 3`
@@ -559,4 +565,32 @@ __VIBESYS_FRAMEWORK_BENCHMARK_JSON__
   }
 ]
 __VIBESYS_FRAMEWORK_BENCHMARK_JSON_END__
+
+## Round 8 — Orchestrator (pre-round)
+- **need_profile**: True
+- **profile_focus**: Profile the exact trusted MPSC benchmark, separating producer token reservation/hint traffic, consumer publication-index and heap maintenance, lane copying, and atomic/cache contention.
+- **reasoning**: The latest optimization passes and exceeds the threshold, but benchmark results remain highly variable and the next bottleneck is not established. A fresh profile is needed to guide the next optimization without invalidating correctness gains.
+
+## Round 8 — Orchestrator (plan)
+- **active_major**: M5 — reduce consumer head-index refresh and stale heap maintenance through an incremental active-lane path.
+- **reasoning**: M4 and its M6 release-side refinement are complete and trusted-gate passing. The remaining visible consumer overhead is that every dequeue refreshes every lane and performs a newest-record witness check even when the lane publication tail is unchanged. A consumer-local tail/repair gate is a bounded M5 slice that should remove stable-lane atomic/cache work while preserving explicit recovery for paused or overwritten publications.
+
+### Task
+Implement the first M5 slice in `src/lib.rs`: add fixed, consumer-local per-lane publication-tail/repair state initialized with `MpscConsumerState`, and use it to make `refresh_head_index`/`refresh_lane_index` return cheaply for a stable lane whose `publication_tail` has not advanced and which has no pending repair. Keep the existing incremental publication catch-up for changed tails. Restrict the newest-record tail witness and bounded lane/token repair scans to detected record mismatch, overwritten publication, pending READY-without-token, or another explicit repair condition; do not perform that witness unconditionally on the stable normal path. Ensure a producer publication racing the consumer's tail load is observed on a subsequent dequeue, and preserve both paused-after-lane-publication and paused-after-occupancy-reservation progress. Keep the authoritative occupancy-token validation and FREE-to-RESERVED reservation CAS, hierarchical advisory hints, reusable fixed slot buffers, min-priority ordering, allocation-free successful operations, fallback backend, and C ABI unchanged. Add focused stress/regression coverage for stable refreshes, concurrent producers, paused reservations, capacities 1/2/3/1024, exact-once copied ownership, priority ordering, undersized output retention, FULL/EMPTY boundaries, and final drain.
+
+### Pass criteria
+The trusted accuracy checker and ABI probes pass for MPSC capacities 1, 2, 3, and 1024, including lower-priority-first dequeue, exact-once copied values, undersized-output retention, paused-after-lane-publication progress, paused-after-occupancy-claim progress, FULL/EMPTY behavior, and final EMPTY drain; SPSC/SPMC/MPMC fallback behavior remains passing. Static inspection of `src/lib.rs` confirms consumer-local per-lane tail/repair state is initialized once per consumer, stable lanes skip publication-record/witness work, changed lanes still catch up incrementally, and repair-only paths retain authoritative token scans and paused-publication recovery. No queue-wide lock, publication bitmap as correctness state, benchmark shortcut, or per-operation allocation is added. The trusted end-to-end MPSC benchmark reports valid conservation counters and a median `total_ops_per_sec` at least as high as the Round 7 framework baseline of 1,721,874.
+## Round 8 — Orchestrator (plan)
+- **reasoning**: M4 and M6 are complete and trusted-gate passing. The remaining identified consumer overhead is unconditional per-dequeue lane refresh and newest-record witness work; consumer-local tail/repair gating is a focused, low-risk M5 slice that should reduce atomic/cache traffic while preserving paused-publication correctness.
+
+### Task
+Implement the first M5 slice in src/lib.rs: add fixed consumer-local per-lane publication-tail and repair state, allowing stable lanes with unchanged publication_tail and no pending repair to skip publication-record and tail-witness work. Preserve incremental catch-up for changed lanes, and retain repair-only recovery for mismatches, overwritten records, pending READY-without-token states, and paused producers. Preserve authoritative occupancy-token validation, advisory hints, reusable buffers, priority ordering, allocation-free operations, fallback behavior, ABI, and add focused concurrency, pause, boundary, ownership, ordering, and drain tests.
+
+### Pass criteria
+Trusted accuracy and ABI checks pass for MPSC capacities 1, 2, 3, and 1024, including priority ordering, exact-once copied values, undersized-output retention, paused-after-lane-publication and paused-after-occupancy-claim progress, FULL/EMPTY behavior, and final drain; fallback scenarios remain passing. Static inspection confirms consumer-local tail/repair state, stable-lane fast paths, incremental changed-lane refresh, and authoritative repair recovery, with no queue-wide lock, correctness bitmap, benchmark shortcut, or per-operation allocation. The trusted end-to-end MPSC benchmark reports valid counters and median total_ops_per_sec at least 1721874.
+## Round 8 — Implementer (attempt 1)
+- **expected_behavior**: Stable MPSC lanes skip unnecessary publication work while changed or repaired lanes remain correct, priority-ordered, allocation-free, copy-safe, bounded, and fully drainable. ABI and fallback behavior remain unchanged.
+
+### Summary
+Implemented M5 consumer-local publication-tail and repair state with stable-lane fast paths, incremental refresh, and authoritative repair recovery. Added paused-publication coverage and validated 13 Rust tests, ABI probes, fallback modes, and benchmark throughput above 1.72M ops/sec.
 

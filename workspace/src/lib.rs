@@ -294,13 +294,27 @@ impl PartialOrd for MpscCandidate {
 struct MpscConsumerState {
     // One FIFO read cursor per producer publication lane. These cursors are
     // consumer-local and are never used as occupancy authority.
-    publication_reads: Vec<usize>,
+    publication_reads: Box<[usize]>,
+    // Fixed consumer-local snapshots of each producer's publication tail.
+    // The tail load is still needed to detect a producer change, but an
+    // unchanged clean lane skips publication-record and tail-witness work.
+    publication_tails: Box<[usize]>,
+    // A lane remains in repair mode after a record mismatch or a READY slot
+    // whose authoritative occupancy token is not visible yet. This is
+    // consumer-local state; it never participates in capacity decisions.
+    repair_states: Box<[MpscLaneRepairState]>,
     // A candidate is present in this table exactly while its heap record is
     // live. It prevents duplicate heap entries and makes stale entries
     // discardable after slot reuse.
     indexed_slots: Vec<Option<MpscCandidate>>,
     slot_count: usize,
     heap: BinaryHeap<MpscCandidate>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MpscLaneRepairState {
+    Clean,
+    Pending,
 }
 
 impl MpscConsumerState {
@@ -322,6 +336,18 @@ impl MpscConsumerState {
             .map_err(|_| STATUS_INTERNAL_ERROR)?;
         publication_reads.resize(lane_count, 0);
 
+        let mut publication_tails = Vec::new();
+        publication_tails
+            .try_reserve_exact(lane_count)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        publication_tails.resize(lane_count, 0);
+
+        let mut repair_states = Vec::new();
+        repair_states
+            .try_reserve_exact(lane_count)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        repair_states.resize(lane_count, MpscLaneRepairState::Clean);
+
         let mut indexed_slots = Vec::new();
         indexed_slots
             .try_reserve_exact(heap_capacity)
@@ -329,7 +355,9 @@ impl MpscConsumerState {
         indexed_slots.resize(heap_capacity, None);
 
         Ok(Self {
-            publication_reads,
+            publication_reads: publication_reads.into_boxed_slice(),
+            publication_tails: publication_tails.into_boxed_slice(),
+            repair_states: repair_states.into_boxed_slice(),
             indexed_slots,
             slot_count,
             heap,
@@ -618,6 +646,7 @@ impl MpscState {
         priority: u64,
         data: &[u8],
         pause_after_lane_reservation: Option<&dyn Fn()>,
+        pause_after_publication: Option<&dyn Fn()>,
         pause_after_occupancy_reservation: Option<&dyn Fn()>,
     ) -> u32 {
         if data.len() > self.max_value_size {
@@ -652,6 +681,9 @@ impl MpscState {
         };
         let lane = &self.lanes[producer_id as usize];
         let publication = lane.begin_publication(slot_index);
+        if let Some(pause) = pause_after_publication {
+            pause();
+        }
         let Some(_token_index) = self.claim_occupancy_token(owner, slot, &lane.next_token) else {
             lane.rollback_publication(publication);
             slot.reset_for_reuse();
@@ -671,7 +703,7 @@ impl MpscState {
     }
 
     fn try_enqueue(&self, producer_id: u32, priority: u64, data: &[u8]) -> u32 {
-        self.try_enqueue_impl(producer_id, priority, data, None, None)
+        self.try_enqueue_impl(producer_id, priority, data, None, None, None)
     }
 
     #[cfg(test)]
@@ -687,7 +719,23 @@ impl MpscState {
             reached.wait();
             resume.wait();
         };
-        self.try_enqueue_impl(producer_id, priority, data, Some(&pause), None)
+        self.try_enqueue_impl(producer_id, priority, data, Some(&pause), None, None)
+    }
+
+    #[cfg(test)]
+    fn try_enqueue_paused_after_publication(
+        &self,
+        producer_id: u32,
+        priority: u64,
+        data: &[u8],
+        reached: &std::sync::Barrier,
+        resume: &std::sync::Barrier,
+    ) -> u32 {
+        let pause = || {
+            reached.wait();
+            resume.wait();
+        };
+        self.try_enqueue_impl(producer_id, priority, data, None, Some(&pause), None)
     }
 
     #[cfg(test)]
@@ -703,7 +751,7 @@ impl MpscState {
             reached.wait();
             resume.wait();
         };
-        self.try_enqueue_impl(producer_id, priority, data, None, Some(&pause))
+        self.try_enqueue_impl(producer_id, priority, data, None, None, Some(&pause))
     }
 
     fn candidate_from_slot(
@@ -820,25 +868,29 @@ impl MpscState {
             } else if slot.state.load(AtomicOrdering::Acquire) == SLOT_READY {
                 // The item is fully copied but its token hint may be stale
                 // while the producer is between token attempts. Preserve the
-                // oldest such sequence for the next bounded repair pass.
+                // oldest such sequence for the next bounded repair pass. A
+                // READY-without-token state is the repair witness even when
+                // the producer is paused immediately after lane publication.
                 let sequence = slot
                     .publication_sequence
                     .load(AtomicOrdering::Acquire);
-                if sequence.wrapping_sub(tail) > usize::MAX / 2
-                    || sequence == tail
-                    || sequence.wrapping_add(1) == tail
-                {
-                    pending = Some(pending.map_or(sequence, |old| old.min(sequence)));
-                }
+                pending = Some(pending.map_or(sequence, |old| old.min(sequence)));
             }
         }
+        consumer.publication_tails[lane_index] = tail;
         consumer.publication_reads[lane_index] = pending.unwrap_or(tail);
+        consumer.repair_states[lane_index] = if pending.is_some() {
+            MpscLaneRepairState::Pending
+        } else {
+            MpscLaneRepairState::Clean
+        };
     }
 
     fn refresh_lane_index(&self, consumer: &mut MpscConsumerState, lane_index: usize) {
         let lane = &self.lanes[lane_index];
         let mut sequence = consumer.publication_reads[lane_index];
         let tail = lane.publication_tail.load(AtomicOrdering::Acquire);
+        consumer.publication_tails[lane_index] = tail;
         while sequence != tail {
             let record = &lane.publications[sequence % lane.publications.len()];
             if record.sequence.load(AtomicOrdering::Acquire) != sequence {
@@ -867,7 +919,9 @@ impl MpscState {
             let Some(candidate) = self.candidate_from_slot(lane_index, slot_index) else {
                 // The producer publishes the tail before the token CAS so a
                 // paused claim is visible here. Do not advance past an
-                // unvalidated record; a later refresh will observe the token.
+                // unvalidated record; a later repair refresh will observe the
+                // token or the producer's rollback.
+                consumer.repair_states[lane_index] = MpscLaneRepairState::Pending;
                 return;
             };
             self.index_candidate(consumer, candidate);
@@ -897,15 +951,30 @@ impl MpscState {
                     == SLOT_READY
                 {
                     consumer.publication_reads[lane_index] = latest;
+                    consumer.repair_states[lane_index] = MpscLaneRepairState::Pending;
                     return;
                 }
             }
         }
         consumer.publication_reads[lane_index] = sequence;
+        consumer.repair_states[lane_index] = MpscLaneRepairState::Clean;
     }
 
     fn refresh_head_index(&self, consumer: &mut MpscConsumerState) {
         for lane_index in 0..self.lanes.len() {
+            let tail = self.lanes[lane_index]
+                .publication_tail
+                .load(AtomicOrdering::Acquire);
+            if tail == consumer.publication_tails[lane_index]
+                && consumer.repair_states[lane_index] == MpscLaneRepairState::Clean
+            {
+                // Stable clean lanes have no new publication records to read
+                // and no repair witness to validate. Keep this branch before
+                // refresh_lane_index so the ordinary dequeue path performs
+                // only the one tail load for such a lane.
+                continue;
+            }
+            consumer.publication_tails[lane_index] = tail;
             self.refresh_lane_index(consumer, lane_index);
         }
     }
@@ -981,6 +1050,7 @@ impl MpscState {
             {
                 self.index_candidate(consumer, replacement);
             }
+            consumer.repair_states[candidate.lane] = MpscLaneRepairState::Pending;
             self.refresh_lane_index(consumer, candidate.lane);
         }
     }
@@ -1136,6 +1206,22 @@ impl Producer {
     ) -> u32 {
         match self.backend.as_ref() {
             Backend::Mpsc(state) => state.try_enqueue_paused_after_lane_reservation(
+                self.id, priority, data, reached, resume,
+            ),
+            Backend::Generic(_) => STATUS_INTERNAL_ERROR,
+        }
+    }
+
+    #[cfg(test)]
+    fn try_enqueue_paused_after_publication(
+        &self,
+        priority: u64,
+        data: &[u8],
+        reached: &std::sync::Barrier,
+        resume: &std::sync::Barrier,
+    ) -> u32 {
+        match self.backend.as_ref() {
+            Backend::Mpsc(state) => state.try_enqueue_paused_after_publication(
                 self.id, priority, data, reached, resume,
             ),
             Backend::Generic(_) => STATUS_INTERNAL_ERROR,
@@ -1442,6 +1528,73 @@ mod tests {
             assert_eq!(consumer.try_dequeue(&mut output), Ok(6));
             assert_eq!(&output[..6], b"paused");
             assert_eq!(consumer.try_dequeue(&mut output), Err(STATUS_EMPTY));
+        });
+    }
+
+    #[test]
+    fn mpsc_publication_pause_uses_repair_and_changed_lane_catchup() {
+        use std::sync::{Arc as TestArc, Barrier};
+        use std::thread;
+
+        let queue = Queue::new(2, 8, 3, 1).unwrap();
+        let producer0 = queue.producer(0).unwrap();
+        let producer1 = queue.producer(1).unwrap();
+        let producer2 = queue.producer(2).unwrap();
+        let mut consumer = queue.consumer(0).unwrap();
+        let reached = TestArc::new(Barrier::new(2));
+        let resume = TestArc::new(Barrier::new(2));
+        let producer_reached = TestArc::clone(&reached);
+        let producer_resume = TestArc::clone(&resume);
+
+        thread::scope(|scope| {
+            let paused = scope.spawn(move || {
+                producer0.try_enqueue_paused_after_publication(
+                    9,
+                    b"paused",
+                    &producer_reached,
+                    &producer_resume,
+                )
+            });
+            reached.wait();
+
+            // The producer has copied its value and published its lane record,
+            // but has not claimed an occupancy token. The consumer must
+            // report EMPTY and retain a repair witness for this lane.
+            let mut output = [0_u8; 8];
+            assert_eq!(consumer.try_dequeue(&mut output), Err(STATUS_EMPTY));
+            assert_eq!(
+                consumer.mpsc.as_ref().unwrap().repair_states[0],
+                MpscLaneRepairState::Pending
+            );
+
+            let mut first = *b"first";
+            assert_eq!(producer1.try_enqueue(1, &first), STATUS_OK);
+            first.fill(0xa5);
+            let mut middle = *b"middle";
+            assert_eq!(producer2.try_enqueue(5, &middle), STATUS_OK);
+            middle.fill(0x5a);
+
+            // Occupancy is authoritative: the two visible items fill the
+            // queue even though the paused lane has a READY slot.
+            assert_eq!(producer1.try_enqueue(0, b"full"), STATUS_FULL);
+
+            let mut undersized = [0xcc_u8; 2];
+            assert_eq!(consumer.try_dequeue(&mut undersized), Err(STATUS_INVALID));
+            assert_eq!(undersized, [0xcc_u8; 2]);
+            assert_eq!(consumer.try_dequeue(&mut output), Ok(5));
+            assert_eq!(&output[..5], b"first");
+            assert_eq!(consumer.try_dequeue(&mut output), Ok(6));
+            assert_eq!(&output[..6], b"middle");
+
+            resume.wait();
+            assert_eq!(paused.join().unwrap(), STATUS_OK);
+            assert_eq!(consumer.try_dequeue(&mut output), Ok(6));
+            assert_eq!(&output[..6], b"paused");
+            assert_eq!(consumer.try_dequeue(&mut output), Err(STATUS_EMPTY));
+            assert_eq!(
+                consumer.mpsc.as_ref().unwrap().repair_states[0],
+                MpscLaneRepairState::Clean
+            );
         });
     }
 
