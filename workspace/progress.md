@@ -443,3 +443,38 @@ The implementation meets the MPSC criteria. It builds the required shared librar
 ### Output
 PASS - mpsc linearizable bounded priority queue (50 trials, approximately 24 ops/trial, 4P/1C, capacity=1024, value_size=8)
 
+## Round 5 — Framework benchmark (attempt 2)
+- **verdict**: pass
+- **command**: `go -C _evaluator/priority-queue run . benchmark --workspace ../.. --scenario mpsc --repetitions 3`
+- **total_ops_per_sec**: 1598400.856755
+
+### Output
+Scenario: mpsc  Repetitions: 3  Median successful ops/s: 1598401
+  Samples: [2.309377037736e+06 1.577487502321e+06 1.598400856755e+06]
+Scenario: mpsc  Duration: 10.000s  Prod: 4  Cons: 1
+  Enqueued: 7992640  Full: 9356928  Dequeued: 7991616  Empty: 0
+  Successful: 15984256  Attempts: 25341184 (1598401 successful ops/s)
+
+__VIBESYS_FRAMEWORK_BENCHMARK_JSON__
+[
+  {
+    "scenario": "mpsc",
+    "enqueued": 7992640,
+    "dropped": 9356928,
+    "dequeued": 7991616,
+    "empty": 0,
+    "attempts": 25341184,
+    "duration": 10.0001548,
+    "total_ops_per_sec": 1598400.856755,
+    "producers": 4,
+    "consumers": 1,
+    "repetitions": 3,
+    "total_ops_per_sec_samples": [
+      2309377.037736,
+      1577487.502321,
+      1598400.856755
+    ]
+  }
+]
+__VIBESYS_FRAMEWORK_BENCHMARK_JSON_END__
+
