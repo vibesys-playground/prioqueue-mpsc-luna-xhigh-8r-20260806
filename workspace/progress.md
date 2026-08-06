@@ -511,3 +511,12 @@ Trusted accuracy, ABI, and MPSC stress checks pass for capacities 1, 2, 3, and 1
 ### Summary
 Implemented M5 active-lane hints with tail-safe clearing, incremental consumer refresh, bounded repair, and added hint-race stress coverage. All 11 Rust tests and ABI probes pass.
 
+## Round 6 — Judge (attempt 1)
+- **verdict**: fail
+
+### Analysis
+The library builds successfully and exports the required ABI. All 11 Rust tests and native probes for MPSC capacities 1, 2, 3, and 1024, 37-byte and 1 MiB values, plus fallback configurations, passed. Static inspection confirms authoritative occupancy-token CAS, reusable storage, incremental active-lane refresh, bounded repair, and no MPSC queue-wide lock or benchmark shortcut. However, three exact 10-second native trusted MPSC benchmarks measured 1,330,385, 978,563, and 975,685 total_ops_per_sec; the median 978,563 is below the required 1,598,401 threshold. The Go wrapper was unavailable because the environment lacks GOROOT, so the equivalent native trusted runner was used. There is also a correctness risk in active-lane hint clearing: a producer can claim and signal a token after the lane refresh observes no token but before the hint clear; the unchanged publication tail then prevents re-signaling, potentially hiding a low-priority item while the heap still contains other items.
+
+### Feedback
+Optimize the MPSC hot path until the exact trusted benchmark median exceeds 1,598,401 total_ops_per_sec. Additionally, close the active-lane lost-signal race: clearing must revalidate authoritative token/publication state or use a sequence/state protocol that cannot clear a signal for a token claimed after the refresh, otherwise a queued low-priority item can be skipped while other heap entries remain.
+
