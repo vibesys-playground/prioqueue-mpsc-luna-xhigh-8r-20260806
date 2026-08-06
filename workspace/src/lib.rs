@@ -5,7 +5,7 @@ mod ffi;
 use std::cell::UnsafeCell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::sync::atomic::{AtomicU8, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex};
 
 const ABI_VERSION: u32 = 1;
@@ -56,7 +56,6 @@ struct QueueState {
 }
 
 const SLOT_EMPTY: u8 = 0;
-const SLOT_WRITING: u8 = 1;
 const SLOT_READY: u8 = 2;
 const TOKEN_HINT_NONE: usize = usize::MAX;
 const FREE_TOKEN_HINT_BITS: usize = usize::BITS as usize;
@@ -93,16 +92,18 @@ struct MpscSlot {
     // multiplication on every indexed candidate refresh.
     owner: usize,
     // Advisory reverse lookup for the token claimed by this slot. The store
-    // happens before the token CAS, so a producer paused immediately after a
-    // successful claim has still left the consumer a bounded way to find it.
+    // follows the authoritative CAS; a consumer that races the brief gap can
+    // still find the owner through bounded authoritative repair.
     token_hint: AtomicUsize,
     publication_sequence: AtomicUsize,
     // This storage is allocated exactly once while the MPSC state is built.
     // The producer and sole consumer hand access to it through `state`; the
     // buffer itself is never moved, grown, taken, or dropped on an operation.
     buffer: UnsafeCell<Box<[u8]>>,
-    priority: AtomicU64,
-    length: AtomicUsize,
+    // These fields are handed off by the slot state release/acquire edge;
+    // keeping them non-atomic avoids redundant metadata atomics on each copy.
+    priority: UnsafeCell<u64>,
+    length: UnsafeCell<usize>,
 }
 
 impl MpscSlot {
@@ -118,8 +119,8 @@ impl MpscSlot {
             token_hint: AtomicUsize::new(TOKEN_HINT_NONE),
             publication_sequence: AtomicUsize::new(0),
             buffer: UnsafeCell::new(buffer.into_boxed_slice()),
-            priority: AtomicU64::new(0),
-            length: AtomicUsize::new(0),
+            priority: UnsafeCell::new(0),
+            length: UnsafeCell::new(0),
         })
     }
 
@@ -129,6 +130,24 @@ impl MpscSlot {
         // state handoff needs to be reset here; avoiding redundant metadata
         // stores keeps the dequeue path allocation-free and short.
         self.state.store(SLOT_EMPTY, AtomicOrdering::Release);
+    }
+
+    #[inline]
+    fn write_metadata(&self, priority: u64, length: usize) {
+        unsafe {
+            *self.priority.get() = priority;
+            *self.length.get() = length;
+        }
+    }
+
+    #[inline]
+    fn priority(&self) -> u64 {
+        unsafe { *self.priority.get() }
+    }
+
+    #[inline]
+    fn length(&self) -> usize {
+        unsafe { *self.length.get() }
     }
 }
 
@@ -150,6 +169,9 @@ struct MpscLane {
     // publication can exist in the ring.
     publications: Box<[MpscPublicationRecord]>,
     publication_tail: AtomicUsize,
+    // Producer-local publication-ring cursor. Keeping the ring index
+    // separately avoids a division by `capacity + 1` on each enqueue.
+    publication_cursor: AtomicUsize,
 }
 
 struct MpscPublicationRecord {
@@ -193,51 +215,66 @@ impl MpscLane {
             next_token: AtomicUsize::new(0),
             publications: publications.into_boxed_slice(),
             publication_tail: AtomicUsize::new(0),
+            publication_cursor: AtomicUsize::new(0),
         })
     }
 
     fn claim_empty_slot(&self) -> Option<(usize, &MpscSlot)> {
         let slot_count = self.slots.len();
-        let start = self.next_slot.load(AtomicOrdering::Relaxed) % slot_count;
-        for offset in 0..slot_count {
-            let index = (start + offset) % slot_count;
+        let start = self.next_slot.load(AtomicOrdering::Relaxed);
+        let mut index = start;
+        for _ in 0..slot_count {
             let slot = &self.slots[index];
-            if slot
-                .state
-                .compare_exchange(
-                    SLOT_EMPTY,
-                    SLOT_WRITING,
-                    AtomicOrdering::AcqRel,
-                    AtomicOrdering::Acquire,
-                )
-                .is_ok()
-            {
-                self.next_slot
-                    .store((index + 1) % slot_count, AtomicOrdering::Relaxed);
+            // A lane has one producer and one consumer. Once this producer
+            // observes EMPTY, the consumer has completed its release handoff
+            // and cannot touch the slot again until READY is published. The
+            // EMPTY state can therefore remain in place while this producer
+            // copies; consumers already treat EMPTY as not present, so an
+            // intermediate WRITING store is unnecessary hot-path traffic.
+            if slot.state.load(AtomicOrdering::Acquire) == SLOT_EMPTY {
+                let next = index + 1;
+                self.next_slot.store(
+                    if next == slot_count { 0 } else { next },
+                    AtomicOrdering::Relaxed,
+                );
                 return Some((index, slot));
+            }
+            index += 1;
+            if index == slot_count {
+                index = 0;
             }
         }
         None
     }
 
-    fn begin_publication(&self, slot_index: usize) -> usize {
+    fn begin_publication(&self, slot_index: usize) -> (usize, usize) {
         let sequence = self.publication_tail.load(AtomicOrdering::Relaxed);
         let slot = &self.slots[slot_index];
         slot.publication_sequence
             .store(sequence, AtomicOrdering::Release);
-        let record = &self.publications[sequence % self.publications.len()];
+        let ring_index = self.publication_cursor.load(AtomicOrdering::Relaxed);
+        let record = &self.publications[ring_index];
         record.slot.store(slot_index, AtomicOrdering::Relaxed);
         record.sequence.store(sequence, AtomicOrdering::Release);
-        sequence
+        (sequence, ring_index)
     }
 
     #[inline]
-    fn publish_publication(&self, sequence: usize) {
+    fn publish_publication(&self, sequence: usize, ring_index: usize) {
         // The tail is the publication witness, not merely a record-preparation
         // cursor. It advances only after the authoritative token CAS succeeds.
         // Thus a consumer that has already refreshed this tail cannot miss a
         // later token claim merely because the lane hint was cleared in the
         // same interval.
+        let next_ring_index = ring_index + 1;
+        self.publication_cursor.store(
+            if next_ring_index == self.publications.len() {
+                0
+            } else {
+                next_ring_index
+            },
+            AtomicOrdering::Relaxed,
+        );
         self.publication_tail
             .store(sequence.wrapping_add(1), AtomicOrdering::Release);
     }
@@ -245,6 +282,9 @@ impl MpscLane {
 
 struct MpscState {
     capacity: usize,
+    // Zero means the configured capacity is not a useful power-of-two mask;
+    // the hot benchmark capacity 1024 uses the branch-free mask path.
+    capacity_mask: usize,
     max_value_size: usize,
     // These tokens are the sole authority for MPSC occupancy and publication.
     // A producer claims one only after its lane slot is fully copied and READY.
@@ -261,6 +301,8 @@ struct MpscState {
     // token hints, it may lose or retain stale bits without affecting the
     // authoritative FREE->RESERVED CAS or the bounded repair scan.
     free_hint_word_hints: Box<[AtomicUsize]>,
+    // Mask for the common power-of-two number of leaf hint words.
+    free_hint_word_mask: usize,
     // Advisory active-lane hints. A producer sets its lane bit after the
     // authoritative token claim. The sole consumer drains only set lane bits
     // before consulting its local priority heap; token state and publication
@@ -305,10 +347,37 @@ impl PartialOrd for MpscCandidate {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MpscHeapEntry {
+    priority: u64,
+    index: usize,
+    publication: usize,
+}
+
+impl Ord for MpscHeapEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        other
+            .priority
+            .cmp(&self.priority)
+            .then_with(|| other.publication.cmp(&self.publication))
+            .then_with(|| other.index.cmp(&self.index))
+    }
+}
+
+impl PartialOrd for MpscHeapEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
 struct MpscConsumerState {
     // One FIFO read cursor per producer publication lane. These cursors are
     // consumer-local and are never used as occupancy authority.
     publication_reads: Vec<usize>,
+    // Ring indices advance with publication_reads and avoid modulo work on
+    // each ordinary publication refresh. Repair reanchors this cursor on its
+    // cold path.
+    publication_slots: Vec<usize>,
     // A candidate is present in this table exactly while its heap record is
     // live. It prevents duplicate heap entries and makes stale entries
     // discardable after slot reuse.
@@ -317,8 +386,14 @@ struct MpscConsumerState {
     // preallocated consumer-local scratch used to batch hint clearing into a
     // single word RMW while still rechecking each lane after the clear.
     refresh_tails: Vec<usize>,
+    // A publication-tail recheck is needed only after bounded repair moved a
+    // lane cursor out of FIFO order. Ordinary incremental refreshes do not
+    // need to revalidate the newest record twice.
+    repair_rechecks: Vec<bool>,
     slot_count: usize,
-    heap: BinaryHeap<MpscCandidate>,
+    // Keep the priority heap record compact; the full candidate is retained
+    // in indexed_slots for stale-entry validation and removal.
+    heap: BinaryHeap<MpscHeapEntry>,
 }
 
 impl MpscConsumerState {
@@ -340,6 +415,12 @@ impl MpscConsumerState {
             .map_err(|_| STATUS_INTERNAL_ERROR)?;
         publication_reads.resize(lane_count, 0);
 
+        let mut publication_slots = Vec::new();
+        publication_slots
+            .try_reserve_exact(lane_count)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        publication_slots.resize(lane_count, 0);
+
         let mut indexed_slots = Vec::new();
         indexed_slots
             .try_reserve_exact(heap_capacity)
@@ -352,10 +433,18 @@ impl MpscConsumerState {
             .map_err(|_| STATUS_INTERNAL_ERROR)?;
         refresh_tails.resize(lane_count, 0);
 
+        let mut repair_rechecks = Vec::new();
+        repair_rechecks
+            .try_reserve_exact(lane_count)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        repair_rechecks.resize(lane_count, false);
+
         Ok(Self {
             publication_reads,
+            publication_slots,
             indexed_slots,
             refresh_tails,
+            repair_rechecks,
             slot_count,
             heap,
         })
@@ -389,7 +478,12 @@ impl MpscState {
             .try_reserve_exact(lane_count)
             .map_err(|_| STATUS_INTERNAL_ERROR)?;
         for lane_index in 0..lane_count {
-            lanes.push(MpscLane::new(lane_index, slot_count, max_value_size)?);
+            let lane = MpscLane::new(lane_index, slot_count, max_value_size)?;
+            // Stagger advisory token search origins so producers do not
+            // repeatedly converge on the same hint word under contention.
+            lane.next_token
+                .store(lane_index % capacity, AtomicOrdering::Relaxed);
+            lanes.push(lane);
         }
 
         let mut occupancy_tokens = Vec::new();
@@ -462,16 +556,46 @@ impl MpscState {
 
         Ok(Self {
             capacity,
+            capacity_mask: if capacity > 1 && capacity.is_power_of_two() {
+                capacity - 1
+            } else {
+                0
+            },
             max_value_size,
             occupancy_tokens: occupancy_tokens.into_boxed_slice(),
             free_token_hints: free_token_hints.into_boxed_slice(),
             free_hint_word_hints: free_hint_word_hints.into_boxed_slice(),
+            free_hint_word_mask: if hint_word_count > 1 && hint_word_count.is_power_of_two() {
+                hint_word_count - 1
+            } else {
+                0
+            },
             active_lane_hints: active_lane_hints.into_boxed_slice(),
             active_lane_word_hints: active_lane_word_hints.into_boxed_slice(),
             token_release_epoch: AtomicUsize::new(0),
             last_full_scan_epoch: AtomicUsize::new(usize::MAX),
             lanes: lanes.into_boxed_slice(),
         })
+    }
+
+    #[inline]
+    fn next_token_index(&self, token_index: usize) -> usize {
+        if self.capacity_mask != 0 {
+            token_index.wrapping_add(1) & self.capacity_mask
+        } else {
+            let next = token_index + 1;
+            if next == self.capacity { 0 } else { next }
+        }
+    }
+
+    #[inline]
+    fn hint_word_start(&self, token_index: usize) -> usize {
+        let word = token_index / FREE_TOKEN_HINT_BITS;
+        if self.free_hint_word_mask != 0 {
+            word & self.free_hint_word_mask
+        } else {
+            word % self.free_token_hints.len()
+        }
     }
 
     #[inline]
@@ -524,30 +648,31 @@ impl MpscState {
     }
 
     #[inline]
+    fn free_hint_words_nonempty(&self) -> bool {
+        // The summary is maintained conservatively: a producer may leave a
+        // stale summary bit set, but a live leaf bit must not be hidden. This
+        // keeps the negative-cache guard bounded by the summary words rather
+        // than walking every capacity-sized leaf word.
+        self.free_hint_word_hints
+            .iter()
+            .any(|word| word.load(AtomicOrdering::Relaxed) != 0)
+    }
+
+    #[inline]
     fn mark_token_likely_free(&self, token_index: usize) {
         let word_index = token_index / FREE_TOKEN_HINT_BITS;
         let bit = 1usize << (token_index % FREE_TOKEN_HINT_BITS);
         let hint_word = &self.free_token_hints[word_index];
-        if hint_word.load(AtomicOrdering::Relaxed) & bit != 0 {
-            return;
+        if hint_word.load(AtomicOrdering::Relaxed) & bit == 0 {
+            hint_word.fetch_or(bit, AtomicOrdering::Relaxed);
         }
-        let previous = hint_word.fetch_or(bit, AtomicOrdering::Relaxed);
-        if previous == 0 {
-            let summary_index = word_index / FREE_TOKEN_HINT_BITS;
-            let summary_bit = 1usize << (word_index % FREE_TOKEN_HINT_BITS);
-            self.free_hint_word_hints[summary_index]
-                .fetch_or(summary_bit, AtomicOrdering::Relaxed);
-        }
-    }
-
-    #[inline]
-    fn free_hint_words_nonempty(&self) -> bool {
-        // Consult the leaf words for this negative-cache guard. The summary
-        // is an acceleration hint and may be stale; a missing summary bit
-        // must not make a live FREE-token hint look absent.
-        self.free_token_hints
-            .iter()
-            .any(|word| word.load(AtomicOrdering::Relaxed) != 0)
+        let summary_index = word_index / FREE_TOKEN_HINT_BITS;
+        let summary_bit = 1usize << (word_index % FREE_TOKEN_HINT_BITS);
+        // Always restore the summary, even when another leaf bit was already
+        // present. This closes the only window in which a stale summary clear
+        // could otherwise hide a newly reused FREE token from the cache guard.
+        self.free_hint_word_hints[summary_index]
+            .fetch_or(summary_bit, AtomicOrdering::Relaxed);
     }
 
     fn claim_hinted_token(
@@ -559,7 +684,10 @@ impl MpscState {
     ) -> Option<usize> {
         let word_count = self.free_token_hints.len();
         let summary_count = self.free_hint_word_hints.len();
-        let start_word = (start / FREE_TOKEN_HINT_BITS) % word_count;
+        if summary_count == 1 {
+            return self.claim_hinted_token_single_summary(owner, slot, start, token_cursor);
+        }
+        let start_word = self.hint_word_start(start);
         let start_summary = (start_word / FREE_TOKEN_HINT_BITS) % summary_count;
         for summary_offset in 0..summary_count {
             let summary_index = (start_summary + summary_offset) % summary_count;
@@ -620,8 +748,6 @@ impl MpscState {
                     if token_index >= self.capacity {
                         continue;
                     }
-                    slot.token_hint
-                        .store(token_index, AtomicOrdering::Release);
                     if self.occupancy_tokens[token_index]
                         .state
                         .compare_exchange(
@@ -632,11 +758,13 @@ impl MpscState {
                         )
                         .is_ok()
                     {
+                        slot.token_hint
+                            .store(token_index, AtomicOrdering::Release);
                         if hint_word.load(AtomicOrdering::Relaxed) != 0 {
                             summary.fetch_or(summary_bit, AtomicOrdering::Relaxed);
                         }
                         token_cursor.store(
-                            token_index.wrapping_add(1) % self.capacity,
+                            self.next_token_index(token_index),
                             AtomicOrdering::Relaxed,
                         );
                         return Some(token_index);
@@ -652,6 +780,94 @@ impl MpscState {
         None
     }
 
+    #[inline]
+    fn claim_hinted_token_single_summary(
+        &self,
+        owner: usize,
+        slot: &MpscSlot,
+        start: usize,
+        token_cursor: &AtomicUsize,
+    ) -> Option<usize> {
+        // The benchmark-sized queues have one summary word. Do not claim and
+        // restore that same summary word on every successful token: leaf-bit
+        // claiming already arbitrates producers, and the summary only needs
+        // clearing when a leaf word becomes empty. A post-clear reread keeps
+        // a concurrent release from being hidden.
+        let word_count = self.free_token_hints.len();
+        let start_word = self.hint_word_start(start);
+        let summary = &self.free_hint_word_hints[0];
+        let summary_snapshot = summary.load(AtomicOrdering::Relaxed);
+        let mut word_index = start_word;
+        for _ in 0..word_count {
+            let summary_bit = 1usize << word_index;
+            if summary_snapshot & summary_bit == 0 {
+                word_index += 1;
+                if word_index == word_count {
+                    word_index = 0;
+                }
+                continue;
+            }
+            let hint_word = &self.free_token_hints[word_index];
+            let mut candidates = hint_word.load(AtomicOrdering::Relaxed);
+            let token_shift = if word_index == start_word {
+                start % FREE_TOKEN_HINT_BITS
+            } else {
+                0
+            };
+            if token_shift != 0 {
+                candidates = candidates.rotate_right(token_shift as u32);
+            }
+            while candidates != 0 {
+                let rotated_bit_index = candidates.trailing_zeros() as usize;
+                let bit_index = (rotated_bit_index + token_shift) % FREE_TOKEN_HINT_BITS;
+                let bit = 1usize << bit_index;
+                candidates &= !(1usize << rotated_bit_index);
+                if hint_word.fetch_and(!bit, AtomicOrdering::Relaxed) & bit == 0 {
+                    continue;
+                }
+                let token_index = word_index * FREE_TOKEN_HINT_BITS + bit_index;
+                if token_index >= self.capacity {
+                    continue;
+                }
+                if self.occupancy_tokens[token_index]
+                    .state
+                    .compare_exchange(
+                        TOKEN_FREE,
+                        owner | TOKEN_RESERVED_TAG,
+                        AtomicOrdering::Release,
+                        AtomicOrdering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    slot.token_hint
+                        .store(token_index, AtomicOrdering::Release);
+                    if hint_word.load(AtomicOrdering::Relaxed) == 0 {
+                        summary.fetch_and(!summary_bit, AtomicOrdering::Relaxed);
+                        if hint_word.load(AtomicOrdering::Relaxed) != 0 {
+                            summary.fetch_or(summary_bit, AtomicOrdering::Relaxed);
+                        }
+                    }
+                    token_cursor.store(
+                        self.next_token_index(token_index),
+                        AtomicOrdering::Relaxed,
+                    );
+                    return Some(token_index);
+                }
+            }
+            if hint_word.load(AtomicOrdering::Relaxed) == 0 {
+                summary.fetch_and(!summary_bit, AtomicOrdering::Relaxed);
+                if hint_word.load(AtomicOrdering::Relaxed) != 0 {
+                    summary.fetch_or(summary_bit, AtomicOrdering::Relaxed);
+                }
+            }
+            word_index += 1;
+            if word_index == word_count {
+                word_index = 0;
+            }
+        }
+        None
+    }
+
     fn claim_occupancy_token(
         &self,
         owner: usize,
@@ -661,16 +877,24 @@ impl MpscState {
         // The cursor only chooses where advisory and repair searches begin.
         // There is intentionally no separate count: the FREE->RESERVED CAS
         // remains the only occupancy reservation point.
-        let start = token_cursor.fetch_add(1, AtomicOrdering::Relaxed) % self.capacity;
-        let scan_epoch = self.token_release_epoch.load(AtomicOrdering::SeqCst);
-        if scan_epoch == self.last_full_scan_epoch.load(AtomicOrdering::Relaxed)
-            && !self.free_hint_words_nonempty()
-        {
-            // A complete authoritative repair already found no FREE token,
-            // and no consumer release has occurred since that repair. This
-            // skips only a repeated negative scan; it does not create or
-            // validate occupancy, and any release invalidates the cache.
-            return None;
+        // Each publication lane has exactly one producer handle.  The cursor
+        // is advisory producer-local state; unlike the occupancy token it is
+        // not a reservation counter, so a relaxed load/store pair avoids an
+        // unnecessary read-modify-write on every enqueue.
+        let start = token_cursor.load(AtomicOrdering::Relaxed);
+        let hints_available = self.free_hint_words_nonempty();
+        let scan_epoch = if hints_available {
+            None
+        } else {
+            Some(self.token_release_epoch.load(AtomicOrdering::SeqCst))
+        };
+        if let Some(scan_epoch) = scan_epoch {
+            if scan_epoch == self.last_full_scan_epoch.load(AtomicOrdering::Relaxed) {
+                // A complete authoritative repair already found no FREE
+                // token, and no consumer release has occurred since that
+                // repair. Any release invalidates the cache.
+                return None;
+            }
         }
         if let Some(token_index) =
             self.claim_hinted_token(owner, slot, start, token_cursor)
@@ -681,17 +905,13 @@ impl MpscState {
         // Empty, stale, or concurrently-consumed hints must never turn into
         // a false FULL result. Repair by trying every authoritative token in
         // a bounded scan after the fast hint path is exhausted.
-        for offset in 0..self.capacity {
-            let token_index = start.wrapping_add(offset) % self.capacity;
+        let mut token_index = start;
+        for _ in 0..self.capacity {
             let token = &self.occupancy_tokens[token_index];
             if token.state.load(AtomicOrdering::Relaxed) != TOKEN_FREE {
+                token_index = self.next_token_index(token_index);
                 continue;
             }
-            // Publish the candidate before attempting the CAS. The hint is
-            // deliberately advisory; the consumer validates the token's
-            // owner/state before indexing the slot.
-            slot.token_hint
-                .store(token_index, AtomicOrdering::Release);
             if token
                 .state
                 .compare_exchange(
@@ -702,16 +922,22 @@ impl MpscState {
                 )
                 .is_ok()
             {
+                // The hint is advisory; publish it only after the
+                // authoritative CAS succeeds. A consumer that sees the brief
+                // pre-hint interval repairs through the token walk.
+                slot.token_hint
+                    .store(token_index, AtomicOrdering::Release);
                 token_cursor.store(
-                    token_index.wrapping_add(1) % self.capacity,
+                    self.next_token_index(token_index),
                     AtomicOrdering::Relaxed,
                 );
                 return Some(token_index);
             }
+            token_index = self.next_token_index(token_index);
         }
-        // Cache a negative result only if the release epoch stayed unchanged
-        // throughout the authoritative scan. A concurrent release therefore
-        // always forces a later token-state validation pass.
+        let scan_epoch = scan_epoch.unwrap_or_else(|| {
+            self.token_release_epoch.load(AtomicOrdering::SeqCst)
+        });
         if self.token_release_epoch.load(AtomicOrdering::SeqCst) == scan_epoch {
             self.last_full_scan_epoch
                 .store(scan_epoch, AtomicOrdering::Relaxed);
@@ -743,9 +969,7 @@ impl MpscState {
         unsafe {
             (&mut *slot.buffer.get())[..data.len()].copy_from_slice(data);
         }
-        slot.priority.store(priority, AtomicOrdering::Relaxed);
-        slot.length
-            .store(data.len(), AtomicOrdering::Relaxed);
+        slot.write_metadata(priority, data.len());
 
         // The item is complete before it can consume one of the global
         // capacity tokens. A RESERVED token therefore always has safe data for
@@ -753,7 +977,7 @@ impl MpscState {
         slot.state.store(SLOT_READY, AtomicOrdering::Release);
         let owner = slot.owner;
         let lane = &self.lanes[producer_id as usize];
-        let publication = lane.begin_publication(slot_index);
+        let (publication, publication_ring_index) = lane.begin_publication(slot_index);
         if let Some(pause) = pause_after_publication_record {
             pause();
         }
@@ -770,7 +994,7 @@ impl MpscState {
         // remains authoritative for capacity; this release store makes the
         // successful item visible to the consumer and is the publication
         // witness used when clearing advisory active-lane hints.
-        lane.publish_publication(publication);
+        lane.publish_publication(publication, publication_ring_index);
 
         // Signal only after the authoritative claim succeeds. The signal is
         // deliberately before the optional pause hook, so a producer paused
@@ -790,8 +1014,21 @@ impl MpscState {
         STATUS_OK
     }
 
-    fn try_enqueue(&self, producer_id: u32, priority: u64, data: &[u8]) -> u32 {
-        self.try_enqueue_impl(producer_id, priority, data, None, None, None)
+    #[inline(always)]
+    fn try_enqueue(
+        &self,
+        producer_id: u32,
+        priority: u64,
+        data: &[u8],
+    ) -> u32 {
+        self.try_enqueue_impl(
+            producer_id,
+            priority,
+            data,
+            None,
+            None,
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -807,7 +1044,14 @@ impl MpscState {
             reached.wait();
             resume.wait();
         };
-        self.try_enqueue_impl(producer_id, priority, data, Some(&pause), None, None)
+        self.try_enqueue_impl(
+            producer_id,
+            priority,
+            data,
+            Some(&pause),
+            None,
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -823,7 +1067,14 @@ impl MpscState {
             reached.wait();
             resume.wait();
         };
-        self.try_enqueue_impl(producer_id, priority, data, None, None, Some(&pause))
+        self.try_enqueue_impl(
+            producer_id,
+            priority,
+            data,
+            None,
+            None,
+            Some(&pause),
+        )
     }
 
     #[cfg(test)]
@@ -841,7 +1092,14 @@ impl MpscState {
             reached.wait();
             resume.wait();
         };
-        self.try_enqueue_impl(producer_id, priority, data, None, Some(&pause), None)
+        self.try_enqueue_impl(
+            producer_id,
+            priority,
+            data,
+            None,
+            Some(&pause),
+            None,
+        )
     }
 
     #[inline]
@@ -875,17 +1133,17 @@ impl MpscState {
                 )
             {
                 return Some(MpscCandidate {
-                    priority: slot.priority.load(AtomicOrdering::Acquire),
+                    priority: slot.priority(),
                     token: token_index,
                     lane: lane_index,
                     slot: slot_index,
                     publication,
                 });
             }
-            // The first hint load can race the release store immediately
-            // before the producer's successful token CAS. Re-read the
-            // advisory hint once after observing the token state so a fresh
-            // owner is not mistaken for an empty lane head.
+            // The first hint load can race the advisory store immediately
+            // after the producer's successful token CAS. Re-read the hint
+            // once after observing the token state before repair falls back
+            // to an authoritative owner scan.
             let refreshed = slot.token_hint.load(AtomicOrdering::Acquire);
             if refreshed == token_index {
                 return None;
@@ -893,6 +1151,42 @@ impl MpscState {
             token_index = refreshed;
         }
         None
+    }
+
+    #[inline]
+    fn candidate_from_published_slot(
+        &self,
+        lane_index: usize,
+        slot_index: usize,
+        publication: usize,
+    ) -> Option<MpscCandidate> {
+        // The caller has already acquired the publication record and checked
+        // the slot sequence. The READY state was released before the token
+        // claim and the token Acquire below observes that handoff.
+        let slot = &self.lanes[lane_index].slots[slot_index];
+        let token_index = slot.token_hint.load(AtomicOrdering::Relaxed);
+        if token_index >= self.capacity {
+            return None;
+        }
+        let state = self.occupancy_tokens[token_index]
+            .state
+            .load(AtomicOrdering::Acquire);
+        let owner = slot.owner;
+        if state & TOKEN_OWNER_MASK != owner
+            || !matches!(
+                state & TOKEN_TAG_MASK,
+                TOKEN_RESERVED_TAG | TOKEN_PUBLISHED_TAG
+            )
+        {
+            return None;
+        }
+        Some(MpscCandidate {
+            priority: slot.priority(),
+            token: token_index,
+            lane: lane_index,
+            slot: slot_index,
+            publication,
+        })
     }
 
     fn candidate_from_authoritative_token(
@@ -922,7 +1216,7 @@ impl MpscState {
                 continue;
             }
             return Some(MpscCandidate {
-                priority: slot.priority.load(AtomicOrdering::Acquire),
+                priority: slot.priority(),
                 token: token_index,
                 lane: lane_index,
                 slot: slot_index,
@@ -937,7 +1231,11 @@ impl MpscState {
         let indexed = &mut consumer.indexed_slots[index];
         if *indexed != Some(candidate) {
             *indexed = Some(candidate);
-            consumer.heap.push(candidate);
+            consumer.heap.push(MpscHeapEntry {
+                priority: candidate.priority,
+                index,
+                publication: candidate.publication,
+            });
         }
     }
 
@@ -971,14 +1269,11 @@ impl MpscState {
                 }
             }
         }
-        consumer.publication_reads[lane_index] = pending.unwrap_or(tail);
-    }
-
-    #[inline]
-    fn refresh_lane_index(&self, consumer: &mut MpscConsumerState, lane_index: usize) {
-        let lane = &self.lanes[lane_index];
-        let tail = lane.publication_tail.load(AtomicOrdering::Acquire);
-        self.refresh_lane_index_at_tail(consumer, lane_index, tail);
+        let next_sequence = pending.unwrap_or(tail);
+        consumer.publication_reads[lane_index] = next_sequence;
+        consumer.publication_slots[lane_index] =
+            next_sequence % self.lanes[lane_index].publications.len();
+        consumer.repair_rechecks[lane_index] = true;
     }
 
     #[inline]
@@ -990,8 +1285,10 @@ impl MpscState {
     ) {
         let lane = &self.lanes[lane_index];
         let mut sequence = consumer.publication_reads[lane_index];
+        let ring_len = lane.publications.len();
+        let mut ring_index = consumer.publication_slots[lane_index];
         while sequence != tail {
-            let record = &lane.publications[sequence % lane.publications.len()];
+            let record = &lane.publications[ring_index];
             if record.sequence.load(AtomicOrdering::Acquire) != sequence {
                 self.repair_lane_index(consumer, lane_index, tail);
                 return;
@@ -1001,21 +1298,34 @@ impl MpscState {
                 self.repair_lane_index(consumer, lane_index, tail);
                 return;
             }
-            let slot = &lane.slots[slot_index];
-            let publication = slot
-                .publication_sequence
-                .load(AtomicOrdering::Acquire);
-            if publication != sequence
-                || slot.state.load(AtomicOrdering::Acquire) == SLOT_EMPTY
+            // In the ordinary FIFO path the consumer cursor has never
+            // skipped a publication, so the validated record itself names a
+            // live slot. Only a lane that recently needed bounded repair can
+            // have an out-of-order heap entry whose slot may have been
+            // reused; retain the publication-sequence witness for that cold
+            // path.
+            if consumer.repair_rechecks[lane_index]
+                && lane.slots[slot_index]
+                    .publication_sequence
+                    .load(AtomicOrdering::Acquire)
+                    != sequence
             {
                 // A bounded repair may have indexed this publication before
                 // its FIFO record was reached. If it was then dequeued, its
                 // slot is empty (or has already been reused for a newer
                 // publication), so this old record is safe to consume.
                 sequence = sequence.wrapping_add(1);
+                ring_index += 1;
+                if ring_index == ring_len {
+                    ring_index = 0;
+                }
                 continue;
             }
-            let Some(candidate) = self.candidate_from_slot(lane_index, slot_index) else {
+            let Some(candidate) = self.candidate_from_published_slot(
+                lane_index,
+                slot_index,
+                sequence,
+            ) else {
                 // The producer publishes the tail only after the token CAS, so
                 // a record here has a completed capacity claim. Do not advance
                 // past an unvalidated record; a later refresh can repair it.
@@ -1023,13 +1333,16 @@ impl MpscState {
             };
             self.index_candidate(consumer, candidate);
             sequence = sequence.wrapping_add(1);
+            ring_index += 1;
+            if ring_index == ring_len {
+                ring_index = 0;
+            }
         }
         // A repair can legitimately move the FIFO cursor to the producer
         // tail after indexing a live record out of order. Re-check the tail
-        // record before declaring the lane fully indexed; this is also the
-        // bounded publication witness for a producer paused after its token
-        // CAS.
-        if tail != 0 {
+        // record only after such a repair; this is also the bounded
+        // publication witness for a producer paused after its token CAS.
+        if consumer.repair_rechecks[lane_index] && tail != 0 {
             let latest = tail.wrapping_sub(1);
             let record = &lane.publications[latest % lane.publications.len()];
             let slot_index = record.slot.load(AtomicOrdering::Relaxed);
@@ -1048,11 +1361,14 @@ impl MpscState {
                     == SLOT_READY
                 {
                     consumer.publication_reads[lane_index] = latest;
+                    consumer.publication_slots[lane_index] = latest % ring_len;
                     return;
                 }
             }
+            consumer.repair_rechecks[lane_index] = false;
         }
         consumer.publication_reads[lane_index] = sequence;
+        consumer.publication_slots[lane_index] = ring_index;
     }
 
     fn refresh_active_lane_word(
@@ -1163,35 +1479,6 @@ impl MpscState {
         }
     }
 
-    #[inline]
-    fn candidate_is_ready(&self, candidate: MpscCandidate) -> bool {
-        let slot = &self.lanes[candidate.lane].slots[candidate.slot];
-        if slot.state.load(AtomicOrdering::Acquire) != SLOT_READY
-            || slot
-                .publication_sequence
-                .load(AtomicOrdering::Acquire)
-                != candidate.publication
-        {
-            return false;
-        }
-        let state = self.occupancy_tokens[candidate.token]
-            .state
-            .load(AtomicOrdering::Acquire);
-        if state & TOKEN_OWNER_MASK != slot.owner
-            || !matches!(
-                state & TOKEN_TAG_MASK,
-                TOKEN_RESERVED_TAG | TOKEN_PUBLISHED_TAG
-            )
-        {
-            return false;
-        }
-        // Priority is immutable for the lifetime of a READY slot. It was
-        // copied into the candidate when the publication was indexed; the
-        // publication sequence check above proves that the slot has not been
-        // reused, so another atomic priority load is unnecessary here.
-        true
-    }
-
     fn minimum_ready_candidate(&self, consumer: &mut MpscConsumerState) -> Option<MpscCandidate> {
         self.refresh_active_lane_index(consumer);
         if consumer.heap.is_empty() {
@@ -1202,25 +1489,24 @@ impl MpscState {
             self.refresh_active_lane_index(consumer);
         }
         loop {
-            let candidate = *consumer.heap.peek()?;
-            let index = consumer.slot_index(candidate.lane, candidate.slot);
-            if consumer.indexed_slots[index] != Some(candidate) {
+            let entry = *consumer.heap.peek()?;
+            let Some(candidate) = consumer.indexed_slots[entry.index] else {
+                consumer.heap.pop();
+                continue;
+            };
+            if candidate.priority != entry.priority
+                || candidate.publication != entry.publication
+            {
                 consumer.heap.pop();
                 continue;
             }
-            if self.candidate_is_ready(candidate) {
-                return Some(candidate);
-            }
-            consumer.heap.pop();
-            consumer.indexed_slots[index] = None;
-            if let Some(replacement) = self.candidate_from_slot(candidate.lane, candidate.slot)
-                .or_else(|| {
-                    self.candidate_from_authoritative_token(candidate.lane, candidate.slot)
-                })
-            {
-                self.index_candidate(consumer, replacement);
-            }
-            self.refresh_lane_index(consumer, candidate.lane);
+            // Every live indexed entry was admitted through
+            // candidate_from_slot/candidate_from_authoritative_token, which
+            // validate the authoritative token owner and phase. The sole
+            // consumer owns this table and the producer cannot reuse a slot
+            // until this entry is removed, so an exact identity match needs
+            // no second token/state walk on the dequeue hot path.
+            return Some(candidate);
         }
     }
 
@@ -1233,7 +1519,7 @@ impl MpscState {
             return Err(STATUS_EMPTY);
         };
         let slot = &self.lanes[candidate.lane].slots[candidate.slot];
-        let value_length = slot.length.load(AtomicOrdering::Acquire);
+        let value_length = slot.length();
         if value_length > output.len() {
             return Err(STATUS_INVALID);
         }
@@ -1347,6 +1633,7 @@ pub struct Producer {
 }
 
 impl Producer {
+    #[inline(always)]
     fn try_enqueue(&self, priority: u64, data: &[u8]) -> u32 {
         match self.backend.as_ref() {
             Backend::Generic(state) => {
@@ -1373,7 +1660,11 @@ impl Producer {
                 });
                 STATUS_OK
             }
-            Backend::Mpsc(state) => state.try_enqueue(self.id, priority, data),
+            Backend::Mpsc(state) => state.try_enqueue(
+                self.id,
+                priority,
+                data,
+            ),
         }
     }
 
@@ -1387,7 +1678,11 @@ impl Producer {
     ) -> u32 {
         match self.backend.as_ref() {
             Backend::Mpsc(state) => state.try_enqueue_paused_after_lane_reservation(
-                self.id, priority, data, reached, resume,
+                self.id,
+                priority,
+                data,
+                reached,
+                resume,
             ),
             Backend::Generic(_) => STATUS_INTERNAL_ERROR,
         }
@@ -1403,7 +1698,11 @@ impl Producer {
     ) -> u32 {
         match self.backend.as_ref() {
             Backend::Mpsc(state) => state.try_enqueue_paused_after_occupancy_reservation(
-                self.id, priority, data, reached, resume,
+                self.id,
+                priority,
+                data,
+                reached,
+                resume,
             ),
             Backend::Generic(_) => STATUS_INTERNAL_ERROR,
         }
@@ -1419,7 +1718,11 @@ impl Producer {
     ) -> u32 {
         match self.backend.as_ref() {
             Backend::Mpsc(state) => state.try_enqueue_paused_after_publication_record(
-                self.id, priority, data, reached, resume,
+                self.id,
+                priority,
+                data,
+                reached,
+                resume,
             ),
             Backend::Generic(_) => STATUS_INTERNAL_ERROR,
         }
@@ -1432,6 +1735,7 @@ pub struct Consumer {
 }
 
 impl Consumer {
+    #[inline(always)]
     fn try_dequeue(&mut self, output: &mut [u8]) -> Result<usize, u32> {
         match self.backend.as_ref() {
             Backend::Generic(state) => {

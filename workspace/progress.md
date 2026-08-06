@@ -556,3 +556,60 @@ The required shared library exists, exports the documented ABI, and matches the 
 ### Feedback
 Optimize the MPSC hot path until the exact evaluator benchmark’s three-run median exceeds 1,598,401 total_ops_per_sec. The current authoritative run’s median is 1,236,056 total_ops_per_sec; re-run the full evaluator benchmark after changes rather than relying on a single favorable sample.
 
+## Round 6 — Implementer (attempt 3)
+
+### Summary
+
+Completed M5 and the benchmark recovery in src/lib.rs. The MPSC backend
+retains preallocated hierarchical active-lane hints and consumer-local
+incremental publication cursors: ordinary dequeue refreshes only signaled
+producer lanes and the dequeued lane before consulting the min-priority heap.
+Hint clearing rechecks publication tails before and after the clear, and
+missing/stale hints still use bounded lane/token repair with authoritative
+occupancy-token owner/state validation. Producer publication and search cursors
+are now handle-local Cell state under the one-thread-per-producer ABI rule,
+removing shared cursor atomics from successful enqueues. The free-token negative
+cache now checks its preallocated summary and defers the sequentially
+consistent release-epoch load to repair paths; successful MPSC enqueue/dequeue
+operations remain allocation-free and the generic fallback/C ABI are unchanged.
+
+Validation: all 12 cargo test --release --locked tests pass, including
+capacities 1/2/3/1024, active-hint repair, paused-claim progress, priority,
+undersized output, copied ownership, conservation, and final drain. Native
+probes pass the MPSC capacities and SPSC/MPMC fallback shapes, and nm confirms
+all required ABI exports. The evaluator-shaped trusted native benchmark
+produced 1,913,565, 1,890,160, and 1,902,805 total ops/sec for the three
+2-second-warmup/10-second runs, median 1,902,805, above the 1,598,401 target.
+The supplied Rust toolchain does not include rustfmt; formatting check was
+unavailable.
+
+## Round 6 — Implementer (attempt 4 correction)
+
+### Summary
+
+The final source state supersedes the experimental handle-local cursor text
+above: publication and search cursors remain shared atomics, while each lane
+still has one producer owner under the candidate contract. M5 retains the
+preallocated hierarchical active-lane hints and ordinary incremental refresh
+of signaled lanes plus the dequeued lane. Hint clearing rechecks publication
+tails before and after clearing; repair-only rechecks, bounded all-lane repair,
+authoritative occupancy-token owner/state validation, priority ordering, copied
+ownership, fallback behavior, ABI exports, and allocation-free operations are
+preserved.
+
+The hot path additionally uses release/acquire-handed-off slot metadata,
+compact priority-heap keys, producer/consumer publication-ring cursors,
+power-of-two token/hint wrapping, and staggered advisory token-search origins.
+`cargo test --release --locked` passes all 12 tests; native MPSC probes pass
+capacities 1, 2, 3, and 1024; and the required ABI exports are present. The
+latest three unpinned evaluator-shaped native benchmark samples were
+1,334,537.697, 1,091,057.130, and 1,307,337.170 total_ops/sec (median
+1,307,337.170), below the 1,598,401 target on this host. A CPU-pinned
+diagnostic run was substantially faster, but no affinity or benchmark-specific
+behavior was added to the candidate.
+## Round 6 — Implementer (attempt 3)
+- **expected_behavior**: MPSC preserves priority ordering, exact-once copied ownership, FULL/EMPTY semantics, paused-claim progress, fallback behavior, ABI compatibility, and final drain across capacities 1, 2, 3, and 1024.
+
+### Summary
+Implemented M5 with preallocated active-lane hints, incremental refresh, race-safe tail rechecks, bounded repair, authoritative token validation, compact heap keys, and allocation-free hot paths. Tests and ABI probes pass; final benchmark median was 1.307M ops/sec on this host.
+
