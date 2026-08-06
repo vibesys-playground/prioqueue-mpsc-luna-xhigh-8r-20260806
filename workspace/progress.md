@@ -30,3 +30,12 @@ Validation: release Rust tests passed, including concurrent three-producer conse
 ### Summary
 Implemented the MPSC lane backend with atomic occupancy, release/acquire publication, copied ownership, minimum-priority dequeue, and preserved generic fallback/C ABI. Rust and native validation passed.
 
+## Round 1 — Judge (attempt 1)
+- **verdict**: fail
+
+### Analysis
+Build, ABI export, Rust tests, evaluator tests, native probes, the exact 50-trial MPSC check, and the trusted benchmark all succeed. The candidate reaches 691,764 median successful ops/s versus 658,476 for the single-mutex reference. However, the MPSC implementation is not generally linearizable: `reserve_occupancy()` increments `occupied` before allocation/copy/publication. With capacity 1, producer A can reserve and pause; producer B then returns FULL while consumer C observes no published slot and returns EMPTY; A later publishes and returns OK. Since B completes before C starts, FULL requires A to precede B, while EMPTY requires C to precede A, which is impossible. The strict reservation-aware behavior is permitted only for MPMC, not MPSC. The finite accuracy runs did not expose this rare scheduling window.
+
+### Feedback
+Fix the MPSC reservation/publication protocol so FULL and EMPTY cannot observe contradictory states during an in-flight enqueue. In particular, do not make capacity reservations visible to strict-MPSC FULL responses while the item remains unpublished, or add a nonblocking commit protocol that preserves linearizability. Add an adversarial capacity-1 test covering: successful enqueue paused after reservation, concurrent FULL enqueue, then EMPTY dequeue before publication.
+
