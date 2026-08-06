@@ -59,6 +59,7 @@ const SLOT_EMPTY: u8 = 0;
 const SLOT_WRITING: u8 = 1;
 const SLOT_READY: u8 = 2;
 const TOKEN_HINT_NONE: usize = usize::MAX;
+const FREE_TOKEN_HINT_BITS: usize = usize::BITS as usize;
 
 // MPSC occupancy is represented by exactly `capacity` independent atomic
 // tokens. The owner and phase are in the same atomic word, so claiming a token
@@ -239,6 +240,11 @@ struct MpscState {
     // A producer claims one only after its lane slot is fully copied and READY.
     // The consumer treats either RESERVED or PUBLISHED as visible.
     occupancy_tokens: Box<[MpscOccupancyToken]>,
+    // Advisory free-token hints. A set bit means that the corresponding
+    // occupancy token was recently observed or released as FREE; token state
+    // remains the only reservation authority. These words are allocated once
+    // with the queue and never resized by an operation.
+    free_token_hints: Box<[AtomicUsize]>,
     lanes: Box<[MpscLane]>,
 }
 
@@ -353,10 +359,30 @@ impl MpscState {
             occupancy_tokens.push(MpscOccupancyToken::new());
         }
 
+        let hint_word_count = capacity
+            .checked_add(FREE_TOKEN_HINT_BITS - 1)
+            .ok_or(STATUS_INTERNAL_ERROR)?
+            / FREE_TOKEN_HINT_BITS;
+        let mut free_token_hints = Vec::new();
+        free_token_hints
+            .try_reserve_exact(hint_word_count)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        for word_index in 0..hint_word_count {
+            let first_token = word_index * FREE_TOKEN_HINT_BITS;
+            let valid_bits = (capacity - first_token).min(FREE_TOKEN_HINT_BITS);
+            let mask = if valid_bits == FREE_TOKEN_HINT_BITS {
+                usize::MAX
+            } else {
+                (1usize << valid_bits) - 1
+            };
+            free_token_hints.push(AtomicUsize::new(mask));
+        }
+
         Ok(Self {
             capacity,
             max_value_size,
             occupancy_tokens: occupancy_tokens.into_boxed_slice(),
+            free_token_hints: free_token_hints.into_boxed_slice(),
             lanes: lanes.into_boxed_slice(),
         })
     }
@@ -374,17 +400,87 @@ impl MpscState {
         }
     }
 
+    #[inline]
+    fn mark_token_likely_free(&self, token_index: usize) {
+        let word_index = token_index / FREE_TOKEN_HINT_BITS;
+        let bit = 1usize << (token_index % FREE_TOKEN_HINT_BITS);
+        self.free_token_hints[word_index].fetch_or(bit, AtomicOrdering::Relaxed);
+    }
+
+    fn claim_hinted_token(
+        &self,
+        owner: usize,
+        slot: &MpscSlot,
+        start: usize,
+        token_cursor: &AtomicUsize,
+    ) -> Option<usize> {
+        let word_count = self.free_token_hints.len();
+        let start_word = (start / FREE_TOKEN_HINT_BITS) % word_count;
+        for word_offset in 0..word_count {
+            let word_index = (start_word + word_offset) % word_count;
+            let hint_word = &self.free_token_hints[word_index];
+            let mut candidates = hint_word.load(AtomicOrdering::Relaxed);
+            while candidates != 0 {
+                let bit_index = candidates.trailing_zeros() as usize;
+                let bit = 1usize << bit_index;
+                candidates &= !bit;
+
+                // Claim the advisory bit so concurrent producers do not all
+                // probe the same likely-free token. This RMW is only a hint
+                // claim; the occupancy-token CAS below remains authoritative.
+                let previous = hint_word.fetch_and(!bit, AtomicOrdering::AcqRel);
+                if previous & bit == 0 {
+                    continue;
+                }
+
+                let token_index = word_index * FREE_TOKEN_HINT_BITS + bit_index;
+                if token_index >= self.capacity {
+                    continue;
+                }
+                slot.token_hint
+                    .store(token_index, AtomicOrdering::Release);
+                if self.occupancy_tokens[token_index]
+                    .state
+                    .compare_exchange(
+                        TOKEN_FREE,
+                        owner | TOKEN_RESERVED_TAG,
+                        AtomicOrdering::AcqRel,
+                        AtomicOrdering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    token_cursor.store(
+                        token_index.wrapping_add(1) % self.capacity,
+                        AtomicOrdering::Relaxed,
+                    );
+                    return Some(token_index);
+                }
+                // The hint was stale or another producer won the CAS. Keep
+                // trying remaining claimed hints before the repair scan.
+            }
+        }
+        None
+    }
+
     fn claim_occupancy_token(
         &self,
         owner: usize,
         slot: &MpscSlot,
         token_cursor: &AtomicUsize,
     ) -> Option<usize> {
-        // There is intentionally no separate count or publication hint here.
-        // The FREE->RESERVED CAS is the only occupancy reservation point; if
-        // every token fails that CAS, FULL can be linearized at the final
-        // failed scan without depending on stale derived state.
+        // The cursor only chooses where advisory and repair searches begin.
+        // There is intentionally no separate count: the FREE->RESERVED CAS
+        // remains the only occupancy reservation point.
         let start = token_cursor.fetch_add(1, AtomicOrdering::Relaxed) % self.capacity;
+        if let Some(token_index) =
+            self.claim_hinted_token(owner, slot, start, token_cursor)
+        {
+            return Some(token_index);
+        }
+
+        // Empty, stale, or concurrently-consumed hints must never turn into
+        // a false FULL result. Repair by trying every authoritative token in
+        // a bounded scan after the fast hint path is exhausted.
         for offset in 0..self.capacity {
             let token_index = start.wrapping_add(offset) % self.capacity;
             let token = &self.occupancy_tokens[token_index];
@@ -820,6 +916,7 @@ impl MpscState {
         self.occupancy_tokens[candidate.token]
             .state
             .store(TOKEN_FREE, AtomicOrdering::Release);
+        self.mark_token_likely_free(candidate.token);
         Ok(value_length)
     }
 
@@ -1039,6 +1136,50 @@ mod tests {
             assert_eq!(&output[..length], expected);
         }
         assert_eq!(consumer.try_dequeue(&mut output), Err(STATUS_EMPTY));
+    }
+
+    #[test]
+    fn mpsc_free_token_hints_are_advisory_and_repaired() {
+        let queue = Queue::new(3, 8, 2, 1).unwrap();
+        let producer0 = queue.producer(0).unwrap();
+        let producer1 = queue.producer(1).unwrap();
+        let mut consumer = queue.consumer(0).unwrap();
+
+        let Backend::Mpsc(state) = queue.backend.as_ref() else {
+            panic!("expected MPSC backend");
+        };
+        assert_eq!(
+            state.free_token_hints.len(),
+            (3 + FREE_TOKEN_HINT_BITS - 1) / FREE_TOKEN_HINT_BITS
+        );
+        let valid_mask = (1usize << 3) - 1;
+        assert_eq!(
+            state.free_token_hints[0].load(AtomicOrdering::Relaxed),
+            valid_mask
+        );
+
+        // Missing hints must repair through the authoritative bounded scan.
+        state.free_token_hints[0].store(0, AtomicOrdering::Relaxed);
+        assert_eq!(producer0.try_enqueue(2, b"first"), STATUS_OK);
+
+        // A stale hint for an occupied token must not produce a false FULL;
+        // the producer retries and claims another authoritative FREE token.
+        let occupied_token = state.lanes[0].slots[0]
+            .token_hint
+            .load(AtomicOrdering::Acquire);
+        state.free_token_hints[0].store(1usize << occupied_token, AtomicOrdering::Relaxed);
+        assert_eq!(producer1.try_enqueue(1, b"second"), STATUS_OK);
+
+        let mut output = [0_u8; 8];
+        assert_eq!(consumer.try_dequeue(&mut output), Ok(6));
+        assert_eq!(&output[..6], b"second");
+        assert_eq!(consumer.try_dequeue(&mut output), Ok(5));
+        assert_eq!(&output[..5], b"first");
+        assert_eq!(consumer.try_dequeue(&mut output), Err(STATUS_EMPTY));
+        assert_ne!(
+            state.free_token_hints[0].load(AtomicOrdering::Relaxed) & valid_mask,
+            0
+        );
     }
 
     #[test]

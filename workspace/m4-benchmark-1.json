@@ -1,0 +1,12 @@
+{
+  "scenario": "mpsc",
+  "enqueued": 525248,
+  "dropped": 176960,
+  "dequeued": 524224,
+  "empty": 0,
+  "attempts": 1226432,
+  "duration": 2.000684900,
+  "total_ops_per_sec": 524556.365673,
+  "producers": 4,
+  "consumers": 1
+}
