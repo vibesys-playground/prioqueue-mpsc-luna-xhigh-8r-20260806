@@ -498,3 +498,14 @@ The candidate builds successfully, exports all nine required ABI symbols, and ca
 ### Feedback
 Optimize the MPSC hot path until the exact trusted 2-second-warmup/10-second/3-repetition benchmark reports a raw median strictly above 1,598,401 total_ops/sec with valid conservation counters. Do not rely on rounded output showing 1,598,401; the raw median must exceed the threshold. Re-run the full trusted accuracy checker in a Go toolchain containing cmp and slices before submission.
 
+## Round 7 — Implementer summary (current attempt)
+
+Kept the Round 5/M4 MPSC implementation and the M6 focused coverage, with no M5 active-lane, publication/index, or negative-full-cache changes. Tightened `MpscState::mark_token_likely_free` by forcing the helper inline and using the validated token index without redundant hint-array bounds checks; it still performs exactly one leaf-word `fetch_or`, uses its returned prior word, and restores the summary bit only for a zero prior leaf word. The authoritative occupancy-token CAS, bounded repair, ABI, fallback backend, allocation-free paths, and memory orderings are unchanged.
+
+Validation: `cargo test --release --locked` passed all 12 tests; Go 1.22 (with `cmp` and `slices`) passed `go test ./...`, all-scenario trusted accuracy at 50 trials, and the MPSC 50-trial checker. Native probes passed capacities 1, 2, 3, and 1024 with 1 MiB values plus SPSC/SPMC/MPMC fallback shapes. Three exact 2-second-warmup/10-second native benchmark repetitions under a fixed 32-CPU affinity reported raw rates 2,480,234.665, 2,262,357.463, and 1,775,322.714 total ops/sec; the raw median was 2,262,357.463 with valid conservation counters. Cargo/rustfmt checks remain unavailable because the active Rust toolchain lacks the rustfmt component.
+## Round 7 — Implementer (attempt 2)
+- **expected_behavior**: MPSC preserves authoritative occupancy, priority ordering, ownership, allocation-free operations, fallback behavior, ABI compatibility, and stale-hint repair.
+
+### Summary
+Implemented M6 release-hint optimization with focused repair tests. Rust and Go 1.22 trusted checks pass; benchmark raw median: 2,262,357.463 ops/sec.
+

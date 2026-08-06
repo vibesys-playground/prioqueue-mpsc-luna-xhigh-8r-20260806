@@ -432,22 +432,32 @@ impl MpscState {
         }
     }
 
-    #[inline]
+    #[inline(always)]
     fn mark_token_likely_free(&self, token_index: usize) {
         let word_index = token_index / FREE_TOKEN_HINT_BITS;
         let bit = 1usize << (token_index % FREE_TOKEN_HINT_BITS);
         // The returned prior leaf word is the only signal needed to repair
         // the summary: a zero prior word means this release made the leaf
         // discoverable, while a nonzero prior word was already discoverable.
-        let prior_leaf_word = self.free_token_hints[word_index]
-            .fetch_or(bit, AtomicOrdering::Relaxed);
+        // The caller has just validated `token_index` against the
+        // authoritative occupancy-token array. Keep this release helper
+        // allocation-free and let the optimizer remove the repeated slice
+        // bounds checks from the hot dequeue path.
+        let prior_leaf_word = unsafe {
+            self.free_token_hints
+                .get_unchecked(word_index)
+                .fetch_or(bit, AtomicOrdering::Relaxed)
+        };
         if prior_leaf_word != 0 {
             return;
         }
         let summary_index = word_index / FREE_TOKEN_HINT_BITS;
         let summary_bit = 1usize << (word_index % FREE_TOKEN_HINT_BITS);
-        self.free_hint_word_hints[summary_index]
-            .fetch_or(summary_bit, AtomicOrdering::Relaxed);
+        unsafe {
+            self.free_hint_word_hints
+                .get_unchecked(summary_index)
+                .fetch_or(summary_bit, AtomicOrdering::Relaxed);
+        }
     }
 
     fn claim_hinted_token(
