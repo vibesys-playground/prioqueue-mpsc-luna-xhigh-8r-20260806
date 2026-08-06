@@ -594,3 +594,12 @@ Trusted accuracy and ABI checks pass for MPSC capacities 1, 2, 3, and 1024, incl
 ### Summary
 Implemented M5 consumer-local publication-tail and repair state with stable-lane fast paths, incremental refresh, and authoritative repair recovery. Added paused-publication coverage and validated 13 Rust tests, ABI probes, fallback modes, and benchmark throughput above 1.72M ops/sec.
 
+## Round 8 — Judge (attempt 1)
+- **verdict**: pass
+
+### Analysis
+The candidate builds the required shared library and exports the complete ABI. MPSC uses fixed per-producer lanes, reusable copied buffers, authoritative atomic occupancy tokens, advisory free-token hints, and consumer-local publication tails, repair state, and a priority heap. Stable lanes skip unchanged refresh work; changed lanes catch up incrementally; repair validates authoritative token ownership. No queue-wide lock, correctness bitmap, benchmark shortcut, or MPSC hot-path allocation is present. Release Rust tests passed 13 tests across five runs. ABI probes passed for capacities 1, 2, 3, and 1024, non-word-aligned and 1 MiB values, copied ownership, undersized-output retention, and fallback configurations. Porcupine accuracy checks passed at all required capacities, and all Go evaluator tests passed. Under the comparable fixed 32-CPU benchmark affinity, samples were 2,121,553, 2,007,944, and 1,677,601 total ops/sec, giving a median of 2,007,944 with valid conservation counters, above the 1,721,874 threshold.
+
+### Feedback
+
+
