@@ -72,3 +72,12 @@ Validation: `cargo test --release` passed all five Rust tests; `make` rebuilt `p
 ### Summary
 Replaced OCCUPANCY_LOCK with nonblocking atomic occupancy tokens, helper-published reservations, bitmap-backed consumer priority selection, and bounded per-producer lanes. Added an adversarial paused-commit test and preserved fallback/C ABI behavior. Rust tests, native probes, and benchmarks pass; progress.md updated.
 
+## Round 1 — Judge (attempt 3)
+- **verdict**: fail
+
+### Analysis
+The required ABI artifact exists and exports all v1 symbols. Cargo tests, evaluator tests, ABI ownership/bounds probes, official MPSC accuracy (50 trials), all-scenario fallback checks, and the trusted benchmark pass. Throughput also improves substantially over the mutex reference (about 2.16M vs 0.66M successful ops/s in comparable runs). However, extended MPSC stress exposed a timing-dependent correctness failure: a producer returned STATUS_INTERNAL_ERROR (status 4) for a valid enqueue at capacity 1. The race is in the separate token-state load/publication path around src/lib.rs:468-489 and publish_reserved_token: the consumer can help, dequeue, and free a token after the producer's snapshot but before publication validation, causing the producer to observe an owner-matching RESERVED/PUBLISHED snapshot with an EMPTY slot. The bitmap/state separation also permits stale publication bits. This violates the contract that valid enqueue returns only OK or FULL and means the MPSC implementation is not reliably linearizable or concurrency-safe.
+
+### Feedback
+Fix the MPSC reservation/publication race before passing. Once a producer has successfully claimed a capacity token, it must not return STATUS_INTERNAL_ERROR because the consumer helped or drained that token. Use the result of the token CAS rather than a later potentially stale load, and redesign publication-bit/state synchronization so a consumer cannot clear/free a token between validation and bitmap publication or leave a stale bitmap bit. Validate with repeated high-contention runs at capacities 1-3 (not only the 50-trial gate), including conservation and drain checks.
+
