@@ -239,6 +239,12 @@ Builds successfully and exports the complete ABI. Rust tests, trusted Go tests, 
 ### Output
 PASS - mpsc linearizable bounded priority queue (50 trials, approximately 24 ops/trial, 4P/1C, capacity=1024, value_size=8)
 
+## M5 — Implementer summary
+
+Added preallocated hierarchical advisory active-lane hints to the MPSC backend. Producers signal their lane after a successful authoritative occupancy-token claim, before the paused-claim hook can block; the sole consumer incrementally refreshes only signaled lanes and the lane just dequeued before consulting the local minimum-priority heap. Hint clearing batches stable lane bits, rechecks publication tails before and after the clear, and re-signals lanes whose publication progress raced the clear. The existing authoritative token owner/state validation and bounded missing/stale-hint repair remain intact. Consumer tail observations are preallocated, so successful enqueue/dequeue operations remain allocation-free; the generic fallback and copying ABI are unchanged.
+
+Added active-hint repair coverage and strengthened paused-claim hint assertions. Repeated Rust stress covers capacities 1, 2, 3, and 1024 with copied-value conservation, priority ordering, undersized-output retention, paused-claim progress, and final drain. `cargo test --release --locked` passes all 11 tests. The final shared library exports the complete ABI and native probes pass MPSC capacities 1/2/3/1024, 37-byte and 1 MiB values, SPSC fallback, and MPMC fallback. Evaluator-shaped native samples were variable on the host, with several valid 1-second samples above 2M successful ops/sec; the 10-second sample reported valid counters and 1.17M successful ops/sec. The bundled Go evaluator remains unavailable because its trimmed Go binary has no configured GOROOT.
+
 ## Round 3 — Framework benchmark (attempt 1)
 - **verdict**: pass
 - **command**: `go -C _evaluator/priority-queue run . benchmark --workspace ../.. --scenario mpsc --repetitions 3`
@@ -477,4 +483,31 @@ __VIBESYS_FRAMEWORK_BENCHMARK_JSON__
   }
 ]
 __VIBESYS_FRAMEWORK_BENCHMARK_JSON_END__
+
+## Round 6 — Orchestrator (pre-round)
+- **need_profile**: False
+- **profile_focus**: 
+- **reasoning**: The latest M4 round passed and substantially improved throughput to 1.60M ops/sec. The next staged optimization is already clear: reduce remaining consumer publication-refresh and heap/index overhead, so profiling is unnecessary before planning.
+
+## Round 6 — Orchestrator (plan)
+- **reasoning**: M4 is now trusted-gate complete at a 1,598,401 total_ops_per_sec median. M5 is the active unfinished Major: ordinary MPSC dequeue still refreshes every producer lane before each heap selection, so an advisory active-lane summary and incremental cursor maintenance are the next structural consumer-side slice. The authoritative occupancy tokens and bounded repair path remain available for correctness recovery.
+
+### Task
+Implement M5 in `src/lib.rs`: make MPSC consumer head-index maintenance incremental over active producer lanes. Add preallocated advisory active-lane hint storage (with summary words if needed for arbitrary producer counts), set when a lane publication tail advances, and have the sole consumer refresh only signaled lanes plus the lane whose item was just removed before consulting the consumer-local min-priority heap. Clear a lane hint only after rechecking its publication tail against the consumer cursor; a concurrent publication must leave the hint set for a later refresh, and stale hints must be harmless. Keep the existing FIFO publication records and heap/index, validate every candidate against the authoritative occupancy-token owner/state, and retain a bounded all-lane/slot repair path only for an empty heap or missing/stale advisory metadata so no valid publication can be lost. Preserve lower-priority-first ordering, paused-after-claim progress, undersized-output retention, exact-once copied ownership, allocation-free successful operations, non-MPSC fallback behavior, and the documented C ABI. Add stress coverage for active-hint races, paused claims, concurrent capacities 1/2/3/1024, priority ordering, conservation, and final drain.
+
+### Pass criteria
+The trusted accuracy checker, ABI probes, and repeated MPSC stress pass for capacities 1, 2, 3, and 1024 with only OK/FULL for valid enqueues, exact-once copied values, lower numeric priorities first, undersized-output retention, paused-after-claim progress, and final EMPTY drain; SPSC/SPMC/MPMC fallback behavior remains intact. Static inspection of `src/lib.rs` confirms that ordinary MPSC dequeue refreshes only active-lane hints/incremental cursors and the selected lane, rather than iterating every producer lane; hint clearing rechecks publication progress, and a bounded repair path handles stale or missing hints without changing occupancy-token authority. The MPSC path has no queue-wide lock/spin-lock, no correctness publication bitmap replacing token state, and no successful-operation allocation or benchmark shortcut. The trusted end-to-end MPSC benchmark reports valid counters and a median `total_ops_per_sec` above the Round 5 baseline of 1,598,401.
+## Round 6 — Orchestrator (plan)
+- **reasoning**: M4 passed and raised the trusted median to 1.60M ops/sec. M5 is the active Major because every dequeue still refreshes all producer lanes and performs avoidable stale-heap maintenance; an incremental active-lane path targets that remaining consumer overhead while preserving the proven token authority.
+
+### Task
+Implement M5 in src/lib.rs: add preallocated advisory active-lane hints and incrementally refresh only signaled producer lanes plus the dequeued lane before consulting the consumer min-priority heap. Recheck publication tails before clearing hints so concurrent publications cannot be missed; retain bounded stale-hint repair, authoritative occupancy-token validation, priority ordering, paused-claim progress, copied ownership, allocation-free operations, fallback behavior, and ABI compatibility. Add stress coverage for hint races, capacities 1/2/3/1024, ordering, conservation, and drain.
+
+### Pass criteria
+Trusted accuracy, ABI, and MPSC stress checks pass for capacities 1, 2, 3, and 1024, including OK/FULL behavior, exact-once copied values, priority ordering, undersized-output retention, paused-claim progress, and final EMPTY drain. Static inspection confirms ordinary dequeue refreshes only active lanes incrementally rather than every producer lane; hint clearing rechecks publication progress, stale/missing hints use bounded repair, occupancy tokens remain authoritative, and no queue-wide lock, correctness bitmap replacement, successful-operation allocation, or benchmark shortcut is added. The trusted end-to-end MPSC benchmark reports valid counters and a median total_ops_per_sec above 1,598,401.
+## Round 6 — Implementer (attempt 1)
+- **expected_behavior**: MPSC operations remain allocation-free, priority-ordered, copy-safe, correctly bounded, race-tolerant, and drain to EMPTY; fallback backends and ABI remain unchanged.
+
+### Summary
+Implemented M5 active-lane hints with tail-safe clearing, incremental consumer refresh, bounded repair, and added hint-race stress coverage. All 11 Rust tests and ABI probes pass.
 

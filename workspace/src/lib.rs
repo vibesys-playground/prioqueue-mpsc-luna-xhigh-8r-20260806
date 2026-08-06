@@ -60,6 +60,7 @@ const SLOT_WRITING: u8 = 1;
 const SLOT_READY: u8 = 2;
 const TOKEN_HINT_NONE: usize = usize::MAX;
 const FREE_TOKEN_HINT_BITS: usize = usize::BITS as usize;
+const ACTIVE_LANE_HINT_BITS: usize = usize::BITS as usize;
 
 // MPSC occupancy is represented by exactly `capacity` independent atomic
 // tokens. The owner and phase are in the same atomic word, so claiming a token
@@ -261,6 +262,14 @@ struct MpscState {
     // token hints, it may lose or retain stale bits without affecting the
     // authoritative FREE->RESERVED CAS or the bounded repair scan.
     free_hint_word_hints: Box<[AtomicUsize]>,
+    // Advisory active-lane hints. A producer sets its lane bit after the
+    // authoritative token claim. The sole consumer drains only set lane bits
+    // before consulting its local priority heap; token state and publication
+    // tails remain the correctness sources of truth.
+    active_lane_hints: Box<[AtomicUsize]>,
+    // Hierarchical summary of non-empty active-lane hint words. Summary bits
+    // may be stale, but are never used to decide whether an item exists.
+    active_lane_word_hints: Box<[AtomicUsize]>,
     lanes: Box<[MpscLane]>,
 }
 
@@ -299,6 +308,10 @@ struct MpscConsumerState {
     // live. It prevents duplicate heap entries and makes stale entries
     // discardable after slot reuse.
     indexed_slots: Vec<Option<MpscCandidate>>,
+    // Last stable tail observed while refreshing a signaled lane. This is
+    // preallocated consumer-local scratch used to batch hint clearing into a
+    // single word RMW while still rechecking each lane after the clear.
+    refresh_tails: Vec<usize>,
     slot_count: usize,
     heap: BinaryHeap<MpscCandidate>,
 }
@@ -328,9 +341,16 @@ impl MpscConsumerState {
             .map_err(|_| STATUS_INTERNAL_ERROR)?;
         indexed_slots.resize(heap_capacity, None);
 
+        let mut refresh_tails = Vec::new();
+        refresh_tails
+            .try_reserve_exact(lane_count)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        refresh_tails.resize(lane_count, 0);
+
         Ok(Self {
             publication_reads,
             indexed_slots,
+            refresh_tails,
             slot_count,
             heap,
         })
@@ -412,12 +432,37 @@ impl MpscState {
             free_hint_word_hints.push(AtomicUsize::new(mask));
         }
 
+        let active_lane_word_count = lane_count
+            .checked_add(ACTIVE_LANE_HINT_BITS - 1)
+            .ok_or(STATUS_INTERNAL_ERROR)?
+            / ACTIVE_LANE_HINT_BITS;
+        let mut active_lane_hints = Vec::new();
+        active_lane_hints
+            .try_reserve_exact(active_lane_word_count)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        for _ in 0..active_lane_word_count {
+            active_lane_hints.push(AtomicUsize::new(0));
+        }
+        let active_lane_summary_count = active_lane_word_count
+            .checked_add(ACTIVE_LANE_HINT_BITS - 1)
+            .ok_or(STATUS_INTERNAL_ERROR)?
+            / ACTIVE_LANE_HINT_BITS;
+        let mut active_lane_word_hints = Vec::new();
+        active_lane_word_hints
+            .try_reserve_exact(active_lane_summary_count)
+            .map_err(|_| STATUS_INTERNAL_ERROR)?;
+        for _ in 0..active_lane_summary_count {
+            active_lane_word_hints.push(AtomicUsize::new(0));
+        }
+
         Ok(Self {
             capacity,
             max_value_size,
             occupancy_tokens: occupancy_tokens.into_boxed_slice(),
             free_token_hints: free_token_hints.into_boxed_slice(),
             free_hint_word_hints: free_hint_word_hints.into_boxed_slice(),
+            active_lane_hints: active_lane_hints.into_boxed_slice(),
+            active_lane_word_hints: active_lane_word_hints.into_boxed_slice(),
             lanes: lanes.into_boxed_slice(),
         })
     }
@@ -429,6 +474,46 @@ impl MpscState {
             Err(STATUS_INTERNAL_ERROR)
         } else {
             Ok(owner)
+        }
+    }
+
+    #[inline]
+    fn signal_active_lane(&self, lane_index: usize) {
+        let word_index = lane_index / ACTIVE_LANE_HINT_BITS;
+        let bit = 1usize << (lane_index % ACTIVE_LANE_HINT_BITS);
+        self.active_lane_hints[word_index].fetch_or(bit, AtomicOrdering::Release);
+
+        if self.active_lane_hints.len() == 1 {
+            return;
+        }
+
+        // Publish the summary after the lane word. Keeping summary bits stale
+        // is harmless, while always refreshing this bit avoids a summary-clear
+        // race from hiding a newly signaled lane.
+        let summary_index = word_index / ACTIVE_LANE_HINT_BITS;
+        let summary_bit = 1usize << (word_index % ACTIVE_LANE_HINT_BITS);
+        self.active_lane_word_hints[summary_index]
+            .fetch_or(summary_bit, AtomicOrdering::Release);
+    }
+
+    #[inline]
+    fn maybe_clear_active_lane_summary(&self, word_index: usize) {
+        if self.active_lane_hints.len() == 1 {
+            return;
+        }
+        if self.active_lane_hints[word_index].load(AtomicOrdering::Acquire) != 0 {
+            return;
+        }
+        let summary_index = word_index / ACTIVE_LANE_HINT_BITS;
+        let summary_bit = 1usize << (word_index % ACTIVE_LANE_HINT_BITS);
+        self.active_lane_word_hints[summary_index]
+            .fetch_and(!summary_bit, AtomicOrdering::AcqRel);
+        // A producer may have set the word after the first check and raced the
+        // summary clear. Restore the summary in that case; summary bits may be
+        // stale, but a live word must never be hidden from the consumer.
+        if self.active_lane_hints[word_index].load(AtomicOrdering::Acquire) != 0 {
+            self.active_lane_word_hints[summary_index]
+                .fetch_or(summary_bit, AtomicOrdering::Release);
         }
     }
 
@@ -643,6 +728,12 @@ impl MpscState {
             return STATUS_FULL;
         };
 
+        // Signal only after the authoritative claim succeeds. The signal is
+        // deliberately before the optional pause hook, so a producer paused
+        // immediately after claiming capacity remains discoverable by the
+        // consumer without waiting for that producer to return.
+        self.signal_active_lane(producer_id as usize);
+
         if let Some(pause) = pause_after_occupancy_reservation {
             pause();
         }
@@ -820,10 +911,22 @@ impl MpscState {
         consumer.publication_reads[lane_index] = pending.unwrap_or(tail);
     }
 
+    #[inline]
     fn refresh_lane_index(&self, consumer: &mut MpscConsumerState, lane_index: usize) {
         let lane = &self.lanes[lane_index];
-        let mut sequence = consumer.publication_reads[lane_index];
         let tail = lane.publication_tail.load(AtomicOrdering::Acquire);
+        self.refresh_lane_index_at_tail(consumer, lane_index, tail);
+    }
+
+    #[inline]
+    fn refresh_lane_index_at_tail(
+        &self,
+        consumer: &mut MpscConsumerState,
+        lane_index: usize,
+        tail: usize,
+    ) {
+        let lane = &self.lanes[lane_index];
+        let mut sequence = consumer.publication_reads[lane_index];
         while sequence != tail {
             let record = &lane.publications[sequence % lane.publications.len()];
             if record.sequence.load(AtomicOrdering::Acquire) != sequence {
@@ -889,9 +992,96 @@ impl MpscState {
         consumer.publication_reads[lane_index] = sequence;
     }
 
-    fn refresh_head_index(&self, consumer: &mut MpscConsumerState) {
-        for lane_index in 0..self.lanes.len() {
-            self.refresh_lane_index(consumer, lane_index);
+    fn refresh_active_lane_word(
+        &self,
+        consumer: &mut MpscConsumerState,
+        word_index: usize,
+        lane_candidates: usize,
+    ) {
+        let active_word = &self.active_lane_hints[word_index];
+        let mut candidates = lane_candidates;
+        let mut clear_mask = 0usize;
+        while candidates != 0 {
+            let lane_bit_index = candidates.trailing_zeros() as usize;
+            let bit = 1usize << lane_bit_index;
+            candidates &= !bit;
+            let lane_index = word_index * ACTIVE_LANE_HINT_BITS + lane_bit_index;
+            if lane_index >= self.lanes.len() {
+                continue;
+            }
+
+            let lane = &self.lanes[lane_index];
+            let tail_before = lane.publication_tail.load(AtomicOrdering::Acquire);
+            self.refresh_lane_index_at_tail(consumer, lane_index, tail_before);
+            let tail_after_refresh = lane.publication_tail.load(AtomicOrdering::Acquire);
+
+            // Do not clear a lane hint while its publication tail is moving.
+            // The producer publishes the tail before the token claim, so a
+            // changed tail is the bounded witness that another publication
+            // may still be between publication and validation.
+            if tail_after_refresh == tail_before {
+                clear_mask |= bit;
+                consumer.refresh_tails[lane_index] = tail_after_refresh;
+            } else {
+                self.signal_active_lane(lane_index);
+            }
+        }
+
+        if clear_mask == 0 {
+            return;
+        }
+
+        // Clear all stable lane hints in one RMW. A producer may signal the
+        // same lane after the snapshot, so each cleared lane is checked again
+        // after this operation and re-signaled if its tail advanced.
+        active_word.fetch_and(!clear_mask, AtomicOrdering::AcqRel);
+        let mut cleared = clear_mask;
+        while cleared != 0 {
+            let lane_bit_index = cleared.trailing_zeros() as usize;
+            let bit = 1usize << lane_bit_index;
+            cleared &= !bit;
+            let lane_index = word_index * ACTIVE_LANE_HINT_BITS + lane_bit_index;
+            if lane_index >= self.lanes.len() {
+                continue;
+            }
+            let tail_after_clear = self.lanes[lane_index]
+                .publication_tail
+                .load(AtomicOrdering::Acquire);
+            if tail_after_clear != consumer.refresh_tails[lane_index] {
+                self.signal_active_lane(lane_index);
+            }
+        }
+        self.maybe_clear_active_lane_summary(word_index);
+    }
+
+    fn refresh_active_lane_index(&self, consumer: &mut MpscConsumerState) {
+        if self.active_lane_hints.len() == 1 {
+            let lane_candidates = self.active_lane_hints[0].load(AtomicOrdering::Acquire);
+            if lane_candidates != 0 {
+                self.refresh_active_lane_word(consumer, 0, lane_candidates);
+            }
+            return;
+        }
+
+        // The summary bounds the normal search to hint words that have been
+        // signaled at least once. Individual lane bits remain advisory: a
+        // stale summary or stale lane bit only causes extra validation work.
+        for (summary_index, summary) in self.active_lane_word_hints.iter().enumerate() {
+            let mut word_candidates = summary.load(AtomicOrdering::Acquire);
+            while word_candidates != 0 {
+                let word_bit_index = word_candidates.trailing_zeros() as usize;
+                let word_bit = 1usize << word_bit_index;
+                word_candidates &= !word_bit;
+                let word_index = summary_index * ACTIVE_LANE_HINT_BITS + word_bit_index;
+                if word_index >= self.active_lane_hints.len() {
+                    continue;
+                }
+                let lane_candidates = self.active_lane_hints[word_index]
+                    .load(AtomicOrdering::Acquire);
+                if lane_candidates != 0 {
+                    self.refresh_active_lane_word(consumer, word_index, lane_candidates);
+                }
+            }
         }
     }
 
@@ -934,7 +1124,7 @@ impl MpscState {
     }
 
     fn minimum_ready_candidate(&self, consumer: &mut MpscConsumerState) -> Option<MpscCandidate> {
-        self.refresh_head_index(consumer);
+        self.refresh_active_lane_index(consumer);
         if consumer.heap.is_empty() && self.has_ready_publication_hint() {
             // A producer may have reused a slot after a bounded repair moved
             // the FIFO cursor to tail. The per-lane tail witness makes this a
@@ -945,7 +1135,7 @@ impl MpscState {
                     .load(AtomicOrdering::Acquire);
                 self.repair_lane_index(consumer, lane_index, tail);
             }
-            self.refresh_head_index(consumer);
+            self.refresh_active_lane_index(consumer);
         }
         loop {
             let candidate = *consumer.heap.peek()?;
@@ -998,6 +1188,17 @@ impl MpscState {
             .state
             .store(TOKEN_FREE, AtomicOrdering::Release);
         self.mark_token_likely_free(candidate.token);
+
+        // The dequeued lane is the one lane whose FIFO head definitely
+        // changed. Refresh it immediately so the next heap consultation sees
+        // a following publication without revisiting unrelated producers.
+        let lane = &self.lanes[candidate.lane];
+        let tail_before = lane.publication_tail.load(AtomicOrdering::Acquire);
+        self.refresh_lane_index_at_tail(consumer, candidate.lane, tail_before);
+        let tail_after = lane.publication_tail.load(AtomicOrdering::Acquire);
+        if tail_after != tail_before {
+            self.signal_active_lane(candidate.lane);
+        }
         Ok(value_length)
     }
 
@@ -1273,6 +1474,32 @@ mod tests {
     }
 
     #[test]
+    fn mpsc_active_lane_hints_are_advisory_and_repaired() {
+        let queue = Queue::new(3, 8, 2, 1).unwrap();
+        let producer = queue.producer(0).unwrap();
+        let mut consumer = queue.consumer(0).unwrap();
+        let Backend::Mpsc(state) = queue.backend.as_ref() else {
+            panic!("expected MPSC backend");
+        };
+
+        assert_eq!(producer.try_enqueue(1, b"repair"), STATUS_OK);
+        for hint in &state.active_lane_hints {
+            hint.store(0, AtomicOrdering::Relaxed);
+        }
+        for hint in &state.active_lane_word_hints {
+            hint.store(0, AtomicOrdering::Relaxed);
+        }
+
+        // A lost advisory signal must not turn a queued item into EMPTY. The
+        // bounded repair path validates the lane slot against authoritative
+        // occupancy tokens and recovers the item.
+        let mut output = [0_u8; 8];
+        assert_eq!(consumer.try_dequeue(&mut output), Ok(6));
+        assert_eq!(&output[..6], b"repair");
+        assert_eq!(consumer.try_dequeue(&mut output), Err(STATUS_EMPTY));
+    }
+
+    #[test]
     fn mpsc_undersized_output_retains_the_minimum_item() {
         let queue = Queue::new(3, 8, 2, 1).unwrap();
         let producer0 = queue.producer(0).unwrap();
@@ -1391,6 +1618,9 @@ mod tests {
         let resume = TestArc::new(Barrier::new(2));
         let producer_reached = TestArc::clone(&reached);
         let producer_resume = TestArc::clone(&resume);
+        let Backend::Mpsc(state) = queue.backend.as_ref() else {
+            panic!("expected MPSC backend");
+        };
 
         thread::scope(|scope| {
             let paused = scope.spawn(move || {
@@ -1402,6 +1632,14 @@ mod tests {
                 )
             });
             reached.wait();
+
+            // The signal is published before the pause hook returns. This
+            // is the active-lane witness that lets the consumer find a
+            // claimed item without refreshing unrelated producer lanes.
+            assert_ne!(
+                state.active_lane_hints[0].load(AtomicOrdering::Acquire) & 1,
+                0
+            );
 
             let (enqueue_tx, enqueue_rx) = mpsc::channel();
             scope.spawn(move || {
