@@ -50,3 +50,12 @@ Validation: `cargo test --release` passed (four tests, including repeated concur
 ### Summary
 Implemented the MPSC lane backend, atomic occupancy publication, consumer min-heap, ownership copying, drain semantics, and capacity-1 adversarial test. Preserved generic fallback and C ABI.
 
+## Round 1 — Judge (attempt 2)
+- **verdict**: fail
+
+### Analysis
+The shared library builds, exports the required ABI, and Rust tests pass. Native ABI probes pass MPSC ownership, capacity-1 boundaries, non-word-aligned and 1 MiB values, undersized-output retention, SPMC, and MPMC fallback behavior. The MPSC benchmark is valid and faster than the reference (about 1.09M versus 0.63M successful ops/s). However, MPSC enqueue/dequeue operations use OCCUPANCY_LOCK as a queue-wide spin lock. acquire_occupancy_lock spins until another producer completes its commit section, and release_occupancy spins while that lock is held. A producer paused after acquiring the lock can block all other producers and the consumer, violating the contract that try operations must not wait for another operation to make progress and undermining the criterion requiring an MPSC hot path without a queue-wide mutex/lock. The Go checker could not run because the available Go 1.19 standard library lacks cmp and slices, but native checks do not eliminate this code-level violation.
+
+### Feedback
+Replace OCCUPANCY_LOCK and its acquire/unlock spin loops with a genuinely nonblocking occupancy/publication protocol. No producer or consumer should depend on a holder reaching the end of a global commit section; use atomic reservation/publication state transitions with bounded failure, rollback, or helping while preserving strict MPSC FULL/EMPTY linearizability. Add an adversarial test that pauses an enqueue during publication/occupancy commit and verifies concurrent enqueue/dequeue calls still return without waiting.
+
