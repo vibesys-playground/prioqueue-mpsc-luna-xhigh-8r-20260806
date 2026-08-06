@@ -427,3 +427,12 @@ The existing paused-claim, ordering, copied-ownership, undersized-output, capaci
 ### Summary
 Implemented M4 advisory free-token hints with hierarchical summaries, authoritative CAS validation, fallback repair scans, cursor rotation, and reduced atomic traffic. Stress tests, ABI probes, and fallback checks pass; exact 10-second benchmark median reached 979,309 ops/sec. Updated progress.md.
 
+## Round 5 — Judge (attempt 2)
+- **verdict**: pass
+
+### Analysis
+The implementation meets the MPSC criteria. It builds the required shared library and exports all ABI symbols. Cargo tests pass, evaluator Go tests pass, and trusted checks pass for MPSC plus fallback scenarios. The MPSC backend uses initialized-once hint storage, occupancy-token FREE-to-RESERVED CAS as the reservation authority, bounded repair for stale hints, per-lane publication tracking, copied fixed storage, priority ordering, undersized-output retention, paused-claim progress, and exact-once draining. The trusted benchmark reports a median total_ops_per_sec of 1,183,586, exceeding the 820,458 baseline. Static inspection found no queue-wide lock, publication correctness bitmap, or benchmark shortcut.
+
+### Feedback
+
+
