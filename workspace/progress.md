@@ -321,3 +321,12 @@ The mandatory throughput criterion is not met: optimize the MPSC hot path and re
 ### Summary
 Implemented M2 with reusable per-slot MPSC buffers, fallible consumer initialization, metadata reset, flattened indexing, and token-scan optimization. Tests and ABI probes pass; benchmark median reached 722,582 ops/sec.
 
+## Round 4 — Judge (attempt 2)
+- **verdict**: pass
+
+### Analysis
+The candidate builds successfully, exports the required ABI symbols/version, and passes all 9 Rust tests plus the evaluator Go tests. Trusted checks pass for MPSC capacities 1, 2, 3, and 1024, including copied ownership, exact-once values, priority ordering, undersized-output retention, paused-claim progress, and final EMPTY drain. SPSC, SPMC, and MPMC fallback checks also pass. MPSC storage and consumer indexing structures are allocated during initialization; enqueue/dequeue paths use fixed buffers and pre-reserved structures without per-operation allocation or buffer ownership transfers. The trusted 3-run MPSC benchmark reports valid counters and a median of 718,698 successful ops/s, above the 457,982 baseline.
+
+### Feedback
+
+
