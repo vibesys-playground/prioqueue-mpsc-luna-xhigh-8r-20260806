@@ -68,14 +68,14 @@ acceptance"); read it before parking or abandoning.
 
 ## Major
 
-- [ ] M1 `in_progress` (round 1): Replace the queue-wide producer mutex for the MPSC configuration with per-producer bounded SPSC publication lanes plus an atomic global occupancy reservation. Why: the current `Mutex<BinaryHeap>` serializes all producers and the single consumer, so removing producer/consumer lock contention is the largest first-order throughput opportunity.
+- [ ] M1 `in_progress` (rounds 1-2): Replace the queue-wide producer mutex for the MPSC configuration with per-producer bounded SPSC publication lanes plus an atomic global occupancy reservation; current corrective slice makes the occupancy token state authoritative for publication. Why: the current structure removes the dominant mutex contention, but the separate bitmap/token finalization protocol still has a rare high-contention race that must be made linearizable before optimization can proceed.
 - [ ] M2 `todo`: Make MPSC slot payload storage reusable and allocation-free after initialization, while retaining the required copy semantics for arbitrary configured value sizes. Why: the baseline allocates a fresh `Vec<u8>` for every successful enqueue, adding allocator and ownership overhead to every measured operation.
 - [ ] M3 `todo`: Optimize consumer-side minimum-priority selection over producer heads with a maintained head index/heap and cache-friendly slot layout. Why: once producers publish independently, repeatedly scanning all producer lanes can become the next consumer bottleneck.
 - [ ] M4 `todo`: Add workload-guided layout and memory-ordering tuning for the MPSC fast path, validated against the trusted end-to-end benchmark. Why: atomics, false sharing, copying, and priority comparisons need measurement-driven refinement after the structural path is correct.
 
 ## Minor
 
-- [ ] N1 `todo`: Correctness/stress hardening for the new MPSC backend, including reservation/publish races, full/empty boundaries, copied ownership, and shutdown drain behavior. Why: this blocks promotion of M1 to `done` if any linearizability or conservation edge case remains.
+- [ ] N1 `in_progress` (blocks: M1): Correctness/stress hardening for the new MPSC backend, including the reservation/publication race, capacities 1-3, full/empty boundaries, copied ownership, and final drain behavior. Why: the judge found a producer-side stale token/bitmap observation that can return STATUS_INTERNAL_ERROR or leave stale publication state, so M1 cannot be promoted until this gate is closed.
 
 ## Done
 

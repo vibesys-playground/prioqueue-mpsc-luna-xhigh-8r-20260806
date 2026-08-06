@@ -75,7 +75,6 @@ const TOKEN_PUBLISHED_TAG: usize = 2usize << (usize::BITS - 2);
 const TOKEN_TAG_MASK: usize = 3usize << (usize::BITS - 2);
 const TOKEN_OWNER_MASK: usize = !TOKEN_TAG_MASK;
 const TOKEN_FREE: usize = 0;
-const BIT_WORD_BITS: usize = usize::BITS as usize;
 
 struct MpscOccupancyToken {
     state: AtomicUsize,
@@ -157,12 +156,10 @@ impl MpscLane {
 struct MpscState {
     capacity: usize,
     max_value_size: usize,
-    // `free_count` is only a fast full hint. Token state remains authoritative
-    // while a producer or the consumer is between its two atomic updates.
-    free_count: AtomicUsize,
-    free_hint: AtomicUsize,
+    // These tokens are the sole authority for MPSC occupancy and publication.
+    // A producer claims one only after its lane slot is fully copied and READY.
+    // The consumer treats either RESERVED or PUBLISHED as visible.
     occupancy_tokens: Box<[MpscOccupancyToken]>,
-    published_bitmap: Box<[AtomicUsize]>,
     lanes: Box<[MpscLane]>,
 }
 
@@ -174,54 +171,11 @@ struct MpscCandidate {
     slot: usize,
 }
 
-impl PartialEq for MpscCandidate {
-    fn eq(&self, other: &Self) -> bool {
-        self.priority == other.priority
-            && self.token == other.token
-            && self.lane == other.lane
-            && self.slot == other.slot
-    }
-}
-
-impl Eq for MpscCandidate {}
-
-impl PartialOrd for MpscCandidate {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for MpscCandidate {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .priority
-            .cmp(&self.priority)
-            .then_with(|| other.token.cmp(&self.token))
-            .then_with(|| other.lane.cmp(&self.lane))
-            .then_with(|| other.slot.cmp(&self.slot))
-    }
-}
-
-struct MpscConsumerState {
-    seen_bitmap: Vec<usize>,
-    heap: BinaryHeap<MpscCandidate>,
-}
+struct MpscConsumerState;
 
 impl MpscConsumerState {
-    fn new(capacity: usize) -> Result<Self, u32> {
-        let bitmap_words = capacity
-            .checked_add(BIT_WORD_BITS - 1)
-            .ok_or(STATUS_INTERNAL_ERROR)?
-            / BIT_WORD_BITS;
-        let mut seen_bitmap = Vec::new();
-        seen_bitmap
-            .try_reserve_exact(bitmap_words)
-            .map_err(|_| STATUS_INTERNAL_ERROR)?;
-        seen_bitmap.resize(bitmap_words, 0);
-        let mut heap = BinaryHeap::new();
-        heap.try_reserve_exact(capacity)
-            .map_err(|_| STATUS_INTERNAL_ERROR)?;
-        Ok(Self { seen_bitmap, heap })
+    fn new() -> Self {
+        Self
     }
 }
 
@@ -258,25 +212,10 @@ impl MpscState {
             occupancy_tokens.push(MpscOccupancyToken::new());
         }
 
-        let bitmap_words = capacity
-            .checked_add(BIT_WORD_BITS - 1)
-            .ok_or(STATUS_INTERNAL_ERROR)?
-            / BIT_WORD_BITS;
-        let mut published_bitmap = Vec::new();
-        published_bitmap
-            .try_reserve_exact(bitmap_words)
-            .map_err(|_| STATUS_INTERNAL_ERROR)?;
-        for _ in 0..bitmap_words {
-            published_bitmap.push(AtomicUsize::new(0));
-        }
-
         Ok(Self {
             capacity,
             max_value_size,
-            free_count: AtomicUsize::new(capacity),
-            free_hint: AtomicUsize::new(0),
             occupancy_tokens: occupancy_tokens.into_boxed_slice(),
-            published_bitmap: published_bitmap.into_boxed_slice(),
             lanes: lanes.into_boxed_slice(),
         })
     }
@@ -307,35 +246,12 @@ impl MpscState {
         Ok((lane, slot))
     }
 
-    fn bitmap_parts(token: usize) -> (usize, usize) {
-        let word = token / BIT_WORD_BITS;
-        let bit = 1usize << (token % BIT_WORD_BITS);
-        (word, bit)
-    }
-
-    fn mark_published(&self, token: usize) {
-        let (word, bit) = Self::bitmap_parts(token);
-        self.published_bitmap[word].fetch_or(bit, AtomicOrdering::Release);
-    }
-
-    fn clear_published(&self, token: usize) {
-        let (word, bit) = Self::bitmap_parts(token);
-        self.published_bitmap[word].fetch_and(!bit, AtomicOrdering::AcqRel);
-    }
-
     fn claim_occupancy_token(&self, owner: usize) -> Option<usize> {
-        // A zero count is a valid, nonblocking full result. It cannot hide a
-        // completed dequeue because the consumer increments it before making
-        // its token FREE. A producer that has claimed a token but has not yet
-        // decremented the hint merely contributes an in-flight enqueue, which
-        // may be linearized before this FULL response.
-        if self.free_count.load(AtomicOrdering::Acquire) == 0 {
-            return None;
-        }
-
-        let start = self.free_hint.load(AtomicOrdering::Relaxed) % self.capacity;
-        for offset in 0..self.capacity {
-            let token_index = (start + offset) % self.capacity;
+        // There is intentionally no separate count or publication hint here.
+        // The FREE->RESERVED CAS is the only occupancy reservation point; if
+        // every token fails that CAS, FULL can be linearized at the final
+        // failed scan without depending on stale derived state.
+        for token_index in 0..self.capacity {
             let token = &self.occupancy_tokens[token_index];
             if token
                 .state
@@ -347,65 +263,10 @@ impl MpscState {
                 )
                 .is_ok()
             {
-                self.free_count.fetch_sub(1, AtomicOrdering::AcqRel);
-                self.free_hint
-                    .store((token_index + 1) % self.capacity, AtomicOrdering::Relaxed);
                 return Some(token_index);
             }
         }
         None
-    }
-
-    fn publish_reserved_token(&self, token_index: usize, state: usize) -> Result<(), u32> {
-        let tag = state & TOKEN_TAG_MASK;
-        if tag != TOKEN_RESERVED_TAG && tag != TOKEN_PUBLISHED_TAG {
-            return Err(STATUS_INTERNAL_ERROR);
-        }
-        let owner = state & TOKEN_OWNER_MASK;
-        let (lane_index, slot_index) = self.decode_owner(owner)?;
-        let slot = &self.lanes[lane_index].slots[slot_index];
-        if slot.state.load(AtomicOrdering::Acquire) != SLOT_READY {
-            return Err(STATUS_INTERNAL_ERROR);
-        }
-
-        let published_state = owner | TOKEN_PUBLISHED_TAG;
-        if tag == TOKEN_RESERVED_TAG {
-            let _ = self.occupancy_tokens[token_index].state.compare_exchange(
-                state,
-                published_state,
-                AtomicOrdering::AcqRel,
-                AtomicOrdering::Acquire,
-            );
-        }
-        let final_state = self.occupancy_tokens[token_index]
-            .state
-            .load(AtomicOrdering::Acquire);
-        if final_state & TOKEN_TAG_MASK != TOKEN_PUBLISHED_TAG
-            || final_state & TOKEN_OWNER_MASK != owner
-        {
-            return Err(STATUS_INTERNAL_ERROR);
-        }
-        self.mark_published(token_index);
-        Ok(())
-    }
-
-    // This bounded pass is needed only when the consumer's published bitmap is
-    // empty. It closes the RESERVED/PUBLISHED publication gap without waiting
-    // for the producer that created it.
-    fn help_pending_publications(&self) -> Result<(), u32> {
-        for token_index in 0..self.capacity {
-            let state = self.occupancy_tokens[token_index]
-                .state
-                .load(AtomicOrdering::Acquire);
-            match state & TOKEN_TAG_MASK {
-                TOKEN_RESERVED_TAG | TOKEN_PUBLISHED_TAG => {
-                    self.publish_reserved_token(token_index, state)?;
-                }
-                TOKEN_FREE => {}
-                _ => return Err(STATUS_INTERNAL_ERROR),
-            }
-        }
-        Ok(())
     }
 
     fn try_enqueue_impl(
@@ -463,6 +324,10 @@ impl MpscState {
             pause();
         }
 
+        // Publication is best effort. The consumer may have selected and
+        // released this token while this producer was paused, in which case
+        // the CAS simply fails. The successful claim above is still the
+        // enqueue's linearization point and must always produce STATUS_OK.
         let reserved_state = owner | TOKEN_RESERVED_TAG;
         let published_state = owner | TOKEN_PUBLISHED_TAG;
         let _ = self.occupancy_tokens[token_index].state.compare_exchange(
@@ -471,22 +336,6 @@ impl MpscState {
             AtomicOrdering::AcqRel,
             AtomicOrdering::Acquire,
         );
-        // A consumer may have helped and even drained this token while the
-        // producer was paused. The successful reservation still belongs to
-        // this enqueue, so returning OK remains correct.
-        let final_state = self.occupancy_tokens[token_index]
-            .state
-            .load(AtomicOrdering::Acquire);
-        if final_state == TOKEN_FREE || final_state & TOKEN_OWNER_MASK != owner {
-            // The sole consumer may have helped and drained this item, and a
-            // different producer may even have reused the token before this
-            // paused call resumed. The original claim still completed this
-            // enqueue successfully.
-            return STATUS_OK;
-        }
-        if let Err(status) = self.publish_reserved_token(token_index, final_state) {
-            return status;
-        }
         STATUS_OK
     }
 
@@ -526,70 +375,59 @@ impl MpscState {
         self.try_enqueue_impl(producer_id, priority, data, None, Some(&pause))
     }
 
-    fn ingest_published(&self, consumer: &mut MpscConsumerState) -> Result<(), u32> {
-        for (word_index, word) in self.published_bitmap.iter().enumerate() {
-            let mut new_tokens =
-                word.load(AtomicOrdering::Acquire) & !consumer.seen_bitmap[word_index];
-            while new_tokens != 0 {
-                let bit_offset = new_tokens.trailing_zeros() as usize;
-                let bit = 1usize << bit_offset;
-                let token_index = word_index * BIT_WORD_BITS + bit_offset;
-                if token_index >= self.capacity {
-                    return Err(STATUS_INTERNAL_ERROR);
-                }
-                let state = self.occupancy_tokens[token_index]
-                    .state
-                    .load(AtomicOrdering::Acquire);
-                if state & TOKEN_TAG_MASK != TOKEN_PUBLISHED_TAG {
-                    return Err(STATUS_INTERNAL_ERROR);
-                }
-                let (lane_index, slot_index) = self.decode_owner(state & TOKEN_OWNER_MASK)?;
-                let slot = &self.lanes[lane_index].slots[slot_index];
-                if slot.state.load(AtomicOrdering::Acquire) != SLOT_READY {
-                    return Err(STATUS_INTERNAL_ERROR);
-                }
-                let priority = unsafe {
-                    (*slot.item.get())
-                        .as_ref()
-                        .ok_or(STATUS_INTERNAL_ERROR)?
-                        .priority
-                };
-                consumer.heap.push(MpscCandidate {
-                    priority,
-                    token: token_index,
-                    lane: lane_index,
-                    slot: slot_index,
-                });
-                consumer.seen_bitmap[word_index] |= bit;
-                new_tokens &= !bit;
+    fn find_minimum_ready_token(&self) -> Option<MpscCandidate> {
+        let mut minimum = None;
+        for token_index in 0..self.capacity {
+            let state = self.occupancy_tokens[token_index]
+                .state
+                .load(AtomicOrdering::Acquire);
+            if !matches!(
+                state & TOKEN_TAG_MASK,
+                TOKEN_RESERVED_TAG | TOKEN_PUBLISHED_TAG
+            ) {
+                continue;
+            }
+
+            let owner = state & TOKEN_OWNER_MASK;
+            let Ok((lane_index, slot_index)) = self.decode_owner(owner) else {
+                continue;
+            };
+            let slot = &self.lanes[lane_index].slots[slot_index];
+            if slot.state.load(AtomicOrdering::Acquire) != SLOT_READY {
+                continue;
+            }
+            let Some(priority) = (unsafe { (*slot.item.get()).as_ref() }).map(|item| item.priority)
+            else {
+                continue;
+            };
+
+            let candidate = MpscCandidate {
+                priority,
+                token: token_index,
+                lane: lane_index,
+                slot: slot_index,
+            };
+            if minimum
+                .map(|current: MpscCandidate| {
+                    (candidate.priority, candidate.token) < (current.priority, current.token)
+                })
+                .unwrap_or(true)
+            {
+                minimum = Some(candidate);
             }
         }
-        Ok(())
-    }
-
-    fn minimum_published_slot<'a>(
-        &'a self,
-        consumer: &MpscConsumerState,
-    ) -> Option<(&'a MpscSlot, MpscCandidate)> {
-        let candidate = *consumer.heap.peek()?;
-        let lane = self.lanes.get(candidate.lane)?;
-        let slot = lane.slots.get(candidate.slot)?;
-        Some((slot, candidate))
+        minimum
     }
 
     fn try_dequeue(
         &self,
         output: &mut [u8],
-        consumer: &mut MpscConsumerState,
+        _consumer: &mut MpscConsumerState,
     ) -> Result<usize, u32> {
-        self.ingest_published(consumer)?;
-        if consumer.heap.is_empty() {
-            self.help_pending_publications()?;
-            self.ingest_published(consumer)?;
-        }
-        let Some((slot, _candidate)) = self.minimum_published_slot(consumer) else {
+        let Some(candidate) = self.find_minimum_ready_token() else {
             return Err(STATUS_EMPTY);
         };
+        let slot = &self.lanes[candidate.lane].slots[candidate.slot];
         let value_length = unsafe {
             (*slot.item.get())
                 .as_ref()
@@ -601,23 +439,16 @@ impl MpscState {
             return Err(STATUS_INVALID);
         }
 
-        let candidate = consumer.heap.pop().ok_or(STATUS_INTERNAL_ERROR)?;
         let item = unsafe { (*slot.item.get()).take() }.ok_or(STATUS_INTERNAL_ERROR)?;
         output[..value_length].copy_from_slice(&item.value);
         drop(item);
         slot.state.store(SLOT_EMPTY, AtomicOrdering::Release);
-        let (word, bit) = Self::bitmap_parts(candidate.token);
-        consumer.seen_bitmap[word] &= !bit;
-        self.clear_published(candidate.token);
-        // Make the abstract dequeue's capacity release visible before making
-        // the token claimable. This ordering makes a stale FREE hint unable to
-        // create a strict-MPSC FULL followed by EMPTY contradiction.
-        self.free_count.fetch_add(1, AtomicOrdering::AcqRel);
+        // Do not make the token FREE until the lane slot is empty. A producer
+        // may claim the token immediately and must never race a consumer still
+        // reading or clearing that slot.
         self.occupancy_tokens[candidate.token]
             .state
             .store(TOKEN_FREE, AtomicOrdering::Release);
-        self.free_hint
-            .store(candidate.token, AtomicOrdering::Relaxed);
         Ok(value_length)
     }
 }
@@ -681,7 +512,7 @@ impl Queue {
             return Err(STATUS_INVALID);
         }
         let mpsc = match self.backend.as_ref() {
-            Backend::Mpsc(state) => Some(MpscConsumerState::new(state.capacity)?),
+            Backend::Mpsc(_) => Some(MpscConsumerState::new()),
             Backend::Generic(_) => None,
         };
         Ok(Consumer {
@@ -878,15 +709,17 @@ mod tests {
     }
 
     #[test]
-    fn mpsc_paused_occupancy_commit_does_not_block_other_calls() {
+    fn mpsc_paused_after_token_claim_does_not_block_or_fail_after_reuse() {
         use std::sync::{mpsc, Arc as TestArc, Barrier};
         use std::thread;
         use std::time::Duration;
 
-        let queue = Queue::new(1, 8, 2, 1).unwrap();
+        let queue = Queue::new(1, 8, 3, 1).unwrap();
         let producer0 = queue.producer(0).unwrap();
         let producer1 = queue.producer(1).unwrap();
+        let producer2 = queue.producer(2).unwrap();
         let consumer = queue.consumer(0).unwrap();
+        let mut consumer_reuse = queue.consumer(0).unwrap();
         let reached = TestArc::new(Barrier::new(2));
         let resume = TestArc::new(Barrier::new(2));
         let producer_reached = TestArc::clone(&reached);
@@ -925,8 +758,15 @@ mod tests {
             assert_eq!(result, Ok(6));
             assert_eq!(&output[..6], b"paused");
 
-            // Neither the FULL enqueue nor the dequeue waited for the paused
-            // producer to finish its publication step.
+            // Reuse and drain the token before the original producer resumes.
+            // Its best-effort publication CAS must then fail harmlessly, and
+            // its already-successful enqueue must still return STATUS_OK.
+            assert_eq!(producer2.try_enqueue(1, b"reused"), STATUS_OK);
+            let mut output = [0_u8; 8];
+            assert_eq!(consumer_reuse.try_dequeue(&mut output), Ok(6));
+            assert_eq!(&output[..6], b"reused");
+            assert_eq!(consumer_reuse.try_dequeue(&mut output), Err(STATUS_EMPTY));
+
             resume.wait();
             assert_eq!(paused.join().unwrap(), STATUS_OK);
         });
@@ -993,5 +833,90 @@ mod tests {
         });
 
         assert!(seen.lock().unwrap().iter().all(|item| *item));
+    }
+
+    #[test]
+    fn mpsc_repeated_small_capacity_stress_conserves_and_drains() {
+        use std::sync::{Arc as TestArc, Mutex as TestMutex};
+        use std::thread;
+
+        const PRODUCERS: usize = 4;
+        const ITEMS_PER_PRODUCER: usize = 128;
+        const REPETITIONS: usize = 8;
+
+        for capacity in [1_usize, 2, 3] {
+            for repetition in 0..REPETITIONS {
+                let queue = Queue::new(capacity as u64, 8, PRODUCERS as u32, 1).unwrap();
+                let producers = (0..PRODUCERS)
+                    .map(|id| (id, queue.producer(id as u32).unwrap()))
+                    .collect::<Vec<_>>();
+                let consumer = queue.consumer(0).unwrap();
+                let seen = TestArc::new(TestMutex::new(vec![false;
+                    PRODUCERS * ITEMS_PER_PRODUCER
+                ]));
+
+                thread::scope(|scope| {
+                    for (producer_id, producer) in producers {
+                        scope.spawn(move || {
+                            for sequence in 0..ITEMS_PER_PRODUCER {
+                                let token = ((producer_id as u64) << 32) | sequence as u64;
+                                let priority = (sequence as u64 * 13
+                                    + producer_id as u64 * 7
+                                    + repetition as u64)
+                                    % 19;
+                                loop {
+                                    match producer.try_enqueue(priority, &token.to_le_bytes()) {
+                                        STATUS_OK => break,
+                                        STATUS_FULL => thread::yield_now(),
+                                        status => panic!(
+                                            "capacity {}, repetition {}: unexpected enqueue status {}",
+                                            capacity,
+                                            repetition,
+                                            status
+                                        ),
+                                    }
+                                }
+                            }
+                        });
+                    }
+
+                    let seen = TestArc::clone(&seen);
+                    scope.spawn(move || {
+                        let mut consumer = consumer;
+                        let mut output = [0_u8; 8];
+                        for _ in 0..PRODUCERS * ITEMS_PER_PRODUCER {
+                            loop {
+                                match consumer.try_dequeue(&mut output) {
+                                    Ok(8) => {
+                                        let token = u64::from_le_bytes(output);
+                                        let producer_id = (token >> 32) as usize;
+                                        let sequence = (token & u64::from(u32::MAX)) as usize;
+                                        assert!(producer_id < PRODUCERS);
+                                        assert!(sequence < ITEMS_PER_PRODUCER);
+                                        let index = producer_id * ITEMS_PER_PRODUCER + sequence;
+                                        let mut seen = seen.lock().unwrap();
+                                        assert!(!seen[index]);
+                                        seen[index] = true;
+                                        break;
+                                    }
+                                    Err(STATUS_EMPTY) => thread::yield_now(),
+                                    result => panic!(
+                                        "capacity {}, repetition {}: unexpected dequeue result {:?}",
+                                        capacity,
+                                        repetition,
+                                        result
+                                    ),
+                                }
+                            }
+                        }
+                    });
+                });
+
+                assert!(seen.lock().unwrap().iter().all(|item| *item));
+                let mut drain = queue.consumer(0).unwrap();
+                let mut output = [0_u8; 8];
+                assert_eq!(drain.try_dequeue(&mut output), Err(STATUS_EMPTY));
+            }
+        }
     }
 }
