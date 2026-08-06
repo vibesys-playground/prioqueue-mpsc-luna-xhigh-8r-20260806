@@ -547,3 +547,12 @@ Optimize the MPSC hot path until the exact trusted benchmark median exceeds 1,59
 ### Summary
 Implemented M5 with race-safe publication tails, incremental active-lane hint refresh, bounded repair, authoritative token validation, allocation-free operations, stress coverage, and preserved ABI/fallback behavior. Tests and native probes pass.
 
+## Round 6 — Judge (attempt 2)
+- **verdict**: fail
+
+### Analysis
+The required shared library exists, exports the documented ABI, and matches the release build. Rust unit tests (12/12), Go evaluator tests, trusted ABI probes, and the full MPSC accuracy gate pass, including capacities 1, 2, 3, and 1024, copied values, undersized output retention, priority ordering, and exact-once behavior. Static review found the MPSC path uses preallocated storage, authoritative occupancy tokens, incremental active-lane refresh, and no queue-wide lock or successful-operation allocation. However, the exact trusted benchmark reports samples of 1,236,056, 1,094,942, and 1,406,745 total_ops_per_sec, with a median of 1,236,056—below the required 1,598,401 threshold. Counters and final-drain conservation are valid, but the headline performance criterion fails.
+
+### Feedback
+Optimize the MPSC hot path until the exact evaluator benchmark’s three-run median exceeds 1,598,401 total_ops_per_sec. The current authoritative run’s median is 1,236,056 total_ops_per_sec; re-run the full evaluator benchmark after changes rather than relying on a single favorable sample.
+
