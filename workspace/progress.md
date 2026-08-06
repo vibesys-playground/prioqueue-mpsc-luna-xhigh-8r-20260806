@@ -613,3 +613,12 @@ behavior was added to the candidate.
 ### Summary
 Implemented M5 with preallocated active-lane hints, incremental refresh, race-safe tail rechecks, bounded repair, authoritative token validation, compact heap keys, and allocation-free hot paths. Tests and ABI probes pass; final benchmark median was 1.307M ops/sec on this host.
 
+## Round 6 — Judge (attempt 3)
+- **verdict**: fail
+
+### Analysis
+The candidate builds successfully, exports all required ABI symbols, and release tests pass (12/12). Native probes pass MPSC capacities 1, 2, 3, and 1024, 1 MiB/non-word-aligned values, and SPSC/SPMC/MPMC fallback shapes. Static inspection confirms reusable slot buffers, authoritative occupancy-token CAS, incremental active-lane refresh, bounded repair, no MPSC queue-wide lock, no correctness bitmap replacement, no successful-operation allocation, and no benchmark shortcut. The full Go checker could not run because the available Go toolchain lacks the required GOROOT/standard-library packages; the bundled trusted native runner was used instead. Three exact evaluator-shaped MPSC benchmark runs reported 1,173,667.865, 1,175,975.196, and 1,233,038.908 total_ops_per_sec with valid counters. The median, 1,175,975.196, is below the mandatory 1,598,401 threshold, so the performance criterion fails.
+
+### Feedback
+Optimize the MPSC hot path until the exact trusted configuration—capacity 1024, value size 8, 4 producers, 1 consumer, 2-second warmup, three 10-second runs—has a median total_ops_per_sec above 1,598,401. Profile active-lane refresh, free-token hint atomics, heap/index maintenance, and producer contention; verify the full three-run median rather than relying on a favorable single sample or CPU-pinned diagnostic run. Preserve the existing correctness, repair, ABI, and allocation-free requirements.
+
