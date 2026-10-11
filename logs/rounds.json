@@ -1,0 +1,66 @@
+[
+  {
+    "round": 1,
+    "commit": "2d87727cc50742d3cb566bb068967e9c72550504",
+    "perf_metric": null,
+    "perf_unit": null,
+    "passed": false,
+    "profile_skipped": true
+  },
+  {
+    "round": 2,
+    "commit": "f2837aed13d54eeb10f856307afa3552c7a9e468",
+    "perf_metric": 98424.818145,
+    "perf_unit": "total_ops_per_sec",
+    "passed": true,
+    "profile_skipped": false
+  },
+  {
+    "round": 3,
+    "commit": "9d68ba5dec8006101e2de992ecad6d7333dbc4a8",
+    "perf_metric": 457982.276466,
+    "perf_unit": "total_ops_per_sec",
+    "passed": true,
+    "profile_skipped": false
+  },
+  {
+    "round": 4,
+    "commit": "6dceffbe033e079f034377c0703f1958ca6273eb",
+    "perf_metric": 820458.210772,
+    "perf_unit": "total_ops_per_sec",
+    "passed": true,
+    "profile_skipped": false
+  },
+  {
+    "round": 5,
+    "commit": "6fc1aefbd5b31125d7276140a101fa6aed0986cb",
+    "perf_metric": 1598400.856755,
+    "perf_unit": "total_ops_per_sec",
+    "passed": true,
+    "profile_skipped": false
+  },
+  {
+    "round": 6,
+    "commit": "f1c5bdad99ec67398868e38d1a096d49e3e6ba80",
+    "perf_metric": null,
+    "perf_unit": null,
+    "passed": false,
+    "profile_skipped": true
+  },
+  {
+    "round": 7,
+    "commit": "04a2b8637d6106f13527645660b437fcafcf7ddc",
+    "perf_metric": 1721874.325885,
+    "perf_unit": "total_ops_per_sec",
+    "passed": true,
+    "profile_skipped": false
+  },
+  {
+    "round": 8,
+    "commit": "ddd0d524e3d45cace6d8ef1387fe5aa5dade1cc3",
+    "perf_metric": 1348455.709998,
+    "perf_unit": "total_ops_per_sec",
+    "passed": true,
+    "profile_skipped": false
+  }
+]

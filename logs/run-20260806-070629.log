@@ -1,0 +1,4 @@
+[gpu] Selected GPU 1 (NVIDIA H100 80GB HBM3): 81554 MiB free / 81559 MiB total, 0% utilisation
+[log] orchestrate run: /home/rairai77/vibe-serve/exp_env/20260806-070629-195373-ca437923-prioqueue-mpsc-luna-56-xhigh-8r/logs/run-20260806-070629.log
+[log] experiment root: /home/rairai77/vibe-serve/exp_env/20260806-070629-195373-ca437923-prioqueue-mpsc-luna-56-xhigh-8r
+[log] objective: Optimize a multi-producer, single-consumer bounded priority queue.

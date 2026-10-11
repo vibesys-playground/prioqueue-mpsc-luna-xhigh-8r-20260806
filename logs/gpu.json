@@ -1,0 +1,53 @@
+{
+  "selected_gpu": {
+    "index": 0,
+    "uuid": "GPU-e82ab913-2d6b-1a55-89a8-9ad23a5a09cf",
+    "name": "NVIDIA H100 80GB HBM3",
+    "memory_used_mib": 5,
+    "memory_total_mib": 81559,
+    "memory_free_mib": 81554,
+    "utilization_pct": 0
+  },
+  "all_gpus_at_selection": [
+    {
+      "index": 0,
+      "uuid": "GPU-e82ab913-2d6b-1a55-89a8-9ad23a5a09cf",
+      "name": "NVIDIA H100 80GB HBM3",
+      "memory_used_mib": 5,
+      "memory_total_mib": 81559,
+      "memory_free_mib": 81554,
+      "utilization_pct": 0
+    },
+    {
+      "index": 1,
+      "uuid": "GPU-4eac38f2-1a70-662a-f6f4-9b62d1778ef4",
+      "name": "NVIDIA H100 80GB HBM3",
+      "memory_used_mib": 5,
+      "memory_total_mib": 81559,
+      "memory_free_mib": 81554,
+      "utilization_pct": 0
+    },
+    {
+      "index": 2,
+      "uuid": "GPU-f7c1496c-b7f5-b1d2-78ea-68826f778059",
+      "name": "NVIDIA H100 80GB HBM3",
+      "memory_used_mib": 5,
+      "memory_total_mib": 81559,
+      "memory_free_mib": 81554,
+      "utilization_pct": 0
+    },
+    {
+      "index": 3,
+      "uuid": "GPU-cfd9ce0a-b7af-895a-f54c-4f175b610977",
+      "name": "NVIDIA H100 80GB HBM3",
+      "memory_used_mib": 5,
+      "memory_total_mib": 81559,
+      "memory_free_mib": 81554,
+      "utilization_pct": 0
+    }
+  ],
+  "selected_at": "2026-08-06T09:01:00.303265",
+  "contention_detected": false,
+  "contention_events": 0,
+  "finished_at": "2026-08-06T13:51:17.974051"
+}
